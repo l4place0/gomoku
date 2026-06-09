@@ -1,0 +1,11 @@
+schema: spec-driven
+
+context: |
+  15×15 五子棋博弈引擎项目，核心目标是研究和提升引擎棋力。
+  技术栈: Python (Pygame GUI) + C++ (搜索引擎 DLL) + KataGomo (神经网络)
+  构建: CMake + MSVC, 支持基础模式和 CUDA 模式
+  架构分为四个维度:
+    - 工程侧 (engineering): UI、构建、接口、日志
+    - 框架层 (framework): 搜索算法、剪枝、置换表、走法生成
+    - 棋力侧 (game-strength): 棋型识别、评估函数、权重、禁手
+    - 机器学习侧 (ml-training): KataGomo 推理、融合、训练、自对弈

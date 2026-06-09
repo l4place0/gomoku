@@ -1,0 +1,22 @@
+{
+  "plan_name": "v3-anti-overfit",
+  "total_rounds": 5,
+  "model_kind": "b10c128",
+  "promotion_threshold": 0.55,
+  "stages": [
+    {
+      "start_round": 1,
+      "end_round": 5,
+      "config": {
+        "sf_games": 400,
+        "sf_visits": 96,
+        "sf_threads": 32,
+        "sh_samples": 30000,
+        "tr_lr": 0.001,
+        "tr_batch": 64,
+        "tr_epochs": 1,
+        "pk_games": 30
+      }
+    }
+  ]
+}

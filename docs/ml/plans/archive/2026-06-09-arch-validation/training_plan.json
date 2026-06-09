@@ -1,0 +1,22 @@
+{
+  "plan_name": "arch-validation",
+  "total_rounds": 2,
+  "model_kind": "b10c128",
+  "promotion_threshold": 0.55,
+  "stages": [
+    {
+      "start_round": 1,
+      "end_round": 2,
+      "config": {
+        "sf_games": 20,
+        "sf_visits": 32,
+        "sf_threads": 16,
+        "sh_samples": 5000,
+        "tr_lr": 0.002,
+        "tr_batch": 32,
+        "tr_epochs": 1,
+        "pk_games": 8
+      }
+    }
+  ]
+}
