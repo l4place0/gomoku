@@ -1,0 +1,4 @@
+[submodule "KataGomo"]
+	path = KataGomo
+	url = https://github.com/hzyhhzy/KataGomo.git
+	branch = Gom2024

@@ -1,0 +1,35 @@
+.venv/
+.vscode/
+__pycache__/
+build/
+logs/
+node_modules/
+.pytest_cache/
+
+*.pyc
+*.pyo
+*.zip
+*.7z
+*.rar
+
+*.dll
+*.lib
+*.exe
+*.pdb
+*.so
+*.a
+
+cudnn*.dll
+cublas*.dll
+cudart*.dll
+zlib.dll
+include/
+KataGomo/training_data/
+
+# Data files
+*.jsonl
+*.ttf
+
+# Model weights
+models/*.bin.gz
+training_data/

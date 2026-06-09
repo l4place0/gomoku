@@ -1,0 +1,27 @@
+[project]
+name = "gomoku"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pygame",
+    "psutil",
+    "packaging>=26.2",
+]
+
+[project.optional-dependencies]
+train = ["torch"]
+gui = ["pygame"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "tests/game", "tests/ml"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+pythonpath = [".", "game", "ml", "tools"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning"
+]
+

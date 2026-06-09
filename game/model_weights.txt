@@ -1,0 +1,18 @@
+# Gomoku linear evaluation weights.
+# Format: key=value. Lines starting with # are ignored.
+
+blend=0.70
+bias=0
+own_scale=1.00
+enemy_scale=1.08
+center_weight=8
+neighbor_weight=18
+forbidden_penalty=100000
+
+pattern.five=100000
+pattern.four=12500
+pattern.blocked_four=6200
+pattern.three=1450
+pattern.blocked_three=620
+pattern.two=260
+pattern.blocked_two=120
