@@ -915,6 +915,20 @@ def cmd_plan_detail(args):
 
 
 # =====================================================================
+# Sync
+# =====================================================================
+
+def cmd_sync(args):
+    """Sync models to Google Drive via tools/sync_drive.py."""
+    sync_script = PROJECT_ROOT / "tools" / "sync_drive.py"
+    cmd = [_find_python(), str(sync_script), "sync"]
+    if getattr(args, "dry_run", False):
+        cmd.append("--dry-run")
+    proc = subprocess.run(cmd, capture_output=False)
+    sys.exit(proc.returncode)
+
+
+# =====================================================================
 # Main
 # =====================================================================
 
@@ -1014,6 +1028,9 @@ def main():
     archive_p = subparsers.add_parser("archive", help="Archive plan")
     archive_p.add_argument("name", type=str)
 
+    sync_p = subparsers.add_parser("sync", help="Sync models to Google Drive")
+    sync_p.add_argument("--dry-run", action="store_true", help="Preview without uploading")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -1036,6 +1053,7 @@ def main():
         "new": cmd_new,
         "list": cmd_list,
         "archive": cmd_archive,
+        "sync": cmd_sync,
         "plans": cmd_plans,
         "plan": cmd_plan_detail,
     }
