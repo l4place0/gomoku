@@ -19,3 +19,11 @@
 - Before running `/opsx-archive` or finalizing any change, the agent **MUST**:
   1. Run `pytest` locally and verify that **100% of all unit and integration tests pass**.
   2. If the change includes UI rendering, GPU usage, or deep self-play logic that cannot be fully automated, follow the corresponding **Manual Verification SOP** in `tests/README.md` and log manual confirmation.
+
+## 4. Git Workflow
+
+All agents MUST follow the branch strategy, commit conventions, and workflow steps defined in [`CONTRIBUTING.md`](CONTRIBUTING.md). Key rules:
+
+- Develop on `dev` branch; `master` receives squash merges only.
+- Commit messages MUST use `type(scope): description` format (feat/fix/refactor/docs/chore).
+- After squash merge to `master`, always reset `dev` to keep branches in sync.
