@@ -18,6 +18,37 @@ import time
 import math
 from typing import List, Tuple, Optional
 
+def sprt_check(wins, losses, alpha=0.05, beta=0.05, elo_diff=35):
+    """
+    Sequential Probability Ratio Test for early termination.
+    Returns: 'candidate_wins', 'baseline_wins', or None (continue).
+    Tests H0: candidate is weaker than baseline by elo_diff vs H1: candidate is stronger.
+    """
+    if wins + losses < 10:
+        return None
+
+    # Convert Elo difference to win probability
+    # P(win) = 1 / (1 + 10^(-elo_diff/400))
+    p1 = 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0))  # under H1
+    p0 = 0.5  # under H0 (equal strength)
+
+    # Log-likelihood ratio
+    llr = 0.0
+    for _ in range(wins):
+        llr += math.log(p1 / p0)
+    for _ in range(losses):
+        llr += math.log((1 - p1) / (1 - p0))
+
+    # Decision boundaries
+    a = math.log(beta / (1 - alpha))
+    b = math.log((1 - beta) / alpha)
+
+    if llr >= b:
+        return "candidate_wins"
+    elif llr <= a:
+        return "baseline_wins"
+    return None
+
 # Constants
 BOARD_SIZE = 15
 BLACK, WHITE = 0, 1
@@ -77,6 +108,7 @@ dll.GetTopMoves.restype = ctypes.c_int
 dll.ReleaseEngine.argtypes = [ctypes.POINTER(GameEngine)]
 
 # Load opening book
+sys.path.insert(0, PROJECT_ROOT)
 from ml.verify_opening_book import OpeningBook
 try:
     opening_book = OpeningBook(OPENING_BOOK_PATH)
@@ -269,16 +301,23 @@ def parse_args():
         default=64,
         help="MCTS search visits for White AI."
     )
+    parser.add_argument(
+        "--early-stop",
+        action="store_true",
+        default=False,
+        help="Enable SPRT early termination when result is statistically significant."
+    )
     return parser.parse_args()
 
 def main():
     args = parse_args()
     print("=" * 60)
     print("Gomoku Headless Runner Initialized")
-    print(f"Black Model: {args.black_model or 'Default DLL Model'}")
-    print(f"White Model: {args.white_model or 'Default DLL Model'}")
+    print(f"Model A (candidate): {args.black_model or 'Default DLL Model'}")
+    print(f"Model B (baseline):  {args.white_model or 'Default DLL Model'}")
     print(f"Games: {args.games}")
     print(f"Output Report: {args.output}")
+    print(f"Early Stop: {args.early_stop}")
     print("=" * 60)
 
     # Spin up White worker subprocess if custom white model configured
@@ -290,13 +329,29 @@ def main():
     white_wins = 0
     active_history = []  # Precise singleton undo tracker
 
+    # Color-balanced tracking: candidate = black_model (model A)
+    candidate_black_wins = 0   # candidate wins when playing black
+    candidate_white_wins = 0   # candidate wins when playing white
+    baseline_black_wins = 0    # baseline wins when playing black
+    baseline_white_wins = 0    # baseline wins when playing white
+    last_white_model = None    # track last white model to avoid unnecessary reloads
+
     # Initialize environment
     env = dll.GetGameEngine()
 
     try:
         for game_idx in range(args.games):
-            print(f"\n[Game {game_idx + 1}/{args.games}] Starting...")
-            
+            # Alternate colors: even games → candidate=black, odd games → baseline=black
+            candidate_is_black = (game_idx % 2 == 0)
+            if candidate_is_black:
+                current_black_model = args.black_model  # candidate
+                current_white_model = args.white_model  # baseline
+                print(f"\n[Game {game_idx + 1}/{args.games}] Starting... (candidate=BLACK, baseline=WHITE)")
+            else:
+                current_black_model = args.white_model  # baseline
+                current_white_model = args.black_model  # candidate
+                print(f"\n[Game {game_idx + 1}/{args.games}] Starting... (baseline=BLACK, candidate=WHITE)")
+
             # 彻底擦除单例引擎上上一局残留的所有棋子
             if active_history:
                 print(f"  [Reset] Undoing {len(active_history)} stones from previous game...")
@@ -304,11 +359,17 @@ def main():
                     dll.UndoMove(env, x, y, r)
                 active_history.clear()
 
-            if args.black_model:
+            # Load black model for this game
+            if current_black_model:
                 if load_kata_model is None:
                     print("  [ERROR] LoadKataModel function not found in DLL, cannot load black model", file=sys.stderr)
                     sys.exit(1)
-                load_kata_model(env, args.black_model.encode("utf-8"), KATA_CONFIG_PATH.encode("utf-8"))
+                load_kata_model(env, current_black_model.encode("utf-8"), KATA_CONFIG_PATH.encode("utf-8"))
+
+            # Reload white worker only when model changes
+            if current_white_model and current_white_model != last_white_model:
+                _reload_white_worker_process(current_white_model)
+                last_white_model = current_white_model
 
             history = []
             winner = None
@@ -441,19 +502,43 @@ def main():
             if winner == BLACK:
                 black_wins += 1
                 winner_str = "BLACK"
+                if candidate_is_black:
+                    candidate_black_wins += 1
+                else:
+                    baseline_black_wins += 1
             elif winner == WHITE:
                 white_wins += 1
                 winner_str = "WHITE"
+                if candidate_is_black:
+                    baseline_white_wins += 1
+                else:
+                    candidate_white_wins += 1
             else:
                 winner_str = "DRAW"
 
+            candidate_total = candidate_black_wins + candidate_white_wins
+            baseline_total = baseline_black_wins + baseline_white_wins
             print(f"[Game {game_idx + 1}] Finished! Winner: {winner_str} in {len(history)} moves")
+            print(f"  Score: candidate={candidate_total} baseline={baseline_total}")
             results.append({
                 "game_id": game_idx + 1,
                 "winner": winner_str,
+                "candidate_is_black": candidate_is_black,
                 "moves": len(history),
                 "history": [(int(x), int(y), int(r)) for x, y, r in history]
             })
+
+            # Early termination check
+            if args.early_stop and game_idx >= 9:  # Need at least 10 games
+                # black_wins and white_wins track the candidate's wins by color
+                candidate_total = candidate_black_wins + candidate_white_wins
+                baseline_total = baseline_black_wins + baseline_white_wins
+                decision = sprt_check(candidate_total, baseline_total)
+                if decision is not None:
+                    print(f"\n[SPRT] Early termination after {game_idx + 1} games! Decision: {decision}")
+                    print(f"  Candidate wins: {candidate_total} (as black: {candidate_black_wins}, as white: {candidate_white_wins})")
+                    print(f"  Baseline wins:  {baseline_total} (as black: {baseline_black_wins}, as white: {baseline_white_wins})")
+                    break
 
     finally:
         # Standard cleanups for sub-processes
@@ -468,14 +553,22 @@ def main():
         dll.ReleaseEngine(env)
 
     # Save summary report
+    total_played = len(results)
+    candidate_total = candidate_black_wins + candidate_white_wins
+    baseline_total = baseline_black_wins + baseline_white_wins
     report = {
         "summary": {
-            "total_games": args.games,
+            "total_games": total_played,
             "black_wins": black_wins,
             "white_wins": white_wins,
-            "draws": args.games - (black_wins + white_wins),
-            "black_win_rate": float(black_wins) / args.games if args.games > 0 else 0,
-            "white_win_rate": float(white_wins) / args.games if args.games > 0 else 0
+            "draws": total_played - (black_wins + white_wins),
+            "candidate_wins": candidate_total,
+            "baseline_wins": baseline_total,
+            "candidate_win_rate": float(candidate_total) / total_played if total_played > 0 else 0,
+            "candidate_black_wins": candidate_black_wins,
+            "candidate_white_wins": candidate_white_wins,
+            "baseline_black_wins": baseline_black_wins,
+            "baseline_white_wins": baseline_white_wins,
         },
         "games": results
     }

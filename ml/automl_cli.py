@@ -705,16 +705,12 @@ def main():
     else:
         # Run PK Match
         if runner_script.exists():
-            # Run two rounds to ensure color balance
-            half_games = max(1, args.pk_games // 2)
-
             # Use task ID to avoid conflicts with orphan processes from killed runs
             pk_task_id = f"r{round_no}_{int(time.time())}"
-            out1 = data_dir / f"pk_sub1_{pk_task_id}.json"
-            out2 = data_dir / f"pk_sub2_{pk_task_id}.json"
+            pk_out = data_dir / f"pk_result_{pk_task_id}.json"
 
             # Clean stale PK results from prior rounds
-            for stale in data_dir.glob("pk_sub*.json"):
+            for stale in data_dir.glob("pk_*.json"):
                 try:
                     stale.unlink()
                 except OSError:
@@ -722,58 +718,42 @@ def main():
 
             print(f"  [PK] Task ID: {pk_task_id}", flush=True)
 
-            # Sub-round 1: Candidate is White, Best Model is Black
-            cmd1 = [
-                _find_python(), str(runner_script),
-                "--black-model", str(GAME_MODEL_PATH),
-                "--white-model", str(candidate_gz_path),
-                "--games", str(half_games),
-                "--visits-black", str(args.pk_visits_b),
-                "--visits-white", str(args.pk_visits_w),
-                "--output", str(out1)
-            ]
-            ok1 = run_subprocess_redirected(cmd1, pk_log)
-
-            # Sub-round 2: Candidate is Black, Best Model is White
-            cmd2 = [
+            # Single process with alternating colors + early stop
+            cmd = [
                 _find_python(), str(runner_script),
                 "--black-model", str(candidate_gz_path),
                 "--white-model", str(GAME_MODEL_PATH),
-                "--games", str(half_games),
+                "--games", str(args.pk_games),
                 "--visits-black", str(args.pk_visits_b),
                 "--visits-white", str(args.pk_visits_w),
-                "--output", str(out2)
+                "--output", str(pk_out),
+                "--early-stop"
             ]
-            # Append log
-            with open(pk_log, "a", encoding="utf-8") as f:
-                f.write("\n--- Sub-Round 2 (Dynamic Color Swap) ---\n")
-            ok2 = run_subprocess_redirected(cmd2, pk_log, mode="a")
+            ok = run_subprocess_redirected(cmd, pk_log)
 
-            # Calculate winrate from JSON outputs
+            # Calculate winrate from JSON output
             wins_new = 0
             losses_new = 0
 
             try:
                 _MAX_JSON_SIZE = 50 * 1024 * 1024  # 50MB
-                if out1.exists():
-                    if out1.stat().st_size > _MAX_JSON_SIZE:
-                        print(f"Warning: {out1} exceeds 50MB limit, skipping", file=sys.stderr)
+                if pk_out.exists():
+                    if pk_out.stat().st_size > _MAX_JSON_SIZE:
+                        print(f"Warning: {pk_out} exceeds 50MB limit, skipping", file=sys.stderr)
                     else:
-                        r1 = json.loads(out1.read_text(encoding="utf-8"))
-                        wins_new += r1["summary"]["white_wins"]
-                        losses_new += r1["summary"]["black_wins"]
-                if out2.exists():
-                    if out2.stat().st_size > _MAX_JSON_SIZE:
-                        print(f"Warning: {out2} exceeds 50MB limit, skipping", file=sys.stderr)
+                        r = json.loads(pk_out.read_text(encoding="utf-8"))
+                        wins_new = r["summary"]["candidate_wins"]
+                        losses_new = r["summary"]["baseline_wins"]
+                        total_pk = wins_new + losses_new
+                        winrate = wins_new / total_pk if total_pk > 0 else 0.0
+                        print(f"  [PK] Result: candidate={wins_new} baseline={losses_new} total={total_pk}", flush=True)
+                        print(f"  [PK] Color split: cand_black={r['summary'].get('candidate_black_wins',0)} cand_white={r['summary'].get('candidate_white_wins',0)}", flush=True)
                     else:
-                        r2 = json.loads(out2.read_text(encoding="utf-8"))
-                        wins_new += r2["summary"]["black_wins"]
-                        losses_new += r2["summary"]["white_wins"]
-
-                total_pk = wins_new + losses_new
-                winrate = wins_new / total_pk if total_pk > 0 else 0.0
+                        winrate = 0.5
+                else:
+                    winrate = 0.5
             except Exception as e:
-                print(f"[Warning] Failed to parse PK sub-reports ({e}). Defaulting to fallback evaluation.", file=sys.stderr)
+                print(f"[Warning] Failed to parse PK report ({e}). Defaulting to fallback evaluation.", file=sys.stderr)
                 winrate = 0.60
                 wins_new = 12
                 losses_new = 8
