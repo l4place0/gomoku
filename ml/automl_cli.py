@@ -17,6 +17,12 @@ import platform
 import time
 from pathlib import Path
 
+try:
+    from ml.benchmark.metrics_collector import StageMetrics
+    _HAS_METRICS = True
+except ImportError:
+    _HAS_METRICS = False
+
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 KATA_ROOT = PROJECT_ROOT / "KataGomo"
@@ -453,6 +459,9 @@ def main():
     # ------------------ STAGE 1: SELFPLAY ------------------
     save_progress("selfplay", 0)
     print(f"\n[Round {round_no}] [1/5] [Selfplay] Generating {args.sf_games} selfplay games...", flush=True)
+    sp_metrics = StageMetrics(round_no, "selfplay") if _HAS_METRICS else None
+    if sp_metrics:
+        sp_metrics.start()
     engine_name = "katago" if sys.platform != "win32" else "katago.exe"
     engine_path = KATA_ROOT / "scripts" / "engine" / engine_name
     cfg_path = data_dir / "native_selfplay_15.cfg"
@@ -503,6 +512,9 @@ def main():
             f.write("Mock selfplay completed successfully\n")
             
     save_progress("selfplay", 100)
+    if sp_metrics:
+        sp_metrics.finish(sf_games=args.sf_games, sf_visits=args.sf_visits, sf_threads=args.sf_threads)
+        sp_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [1/5] [Selfplay] Complete.", flush=True)
     
     # ------------------ STAGE 2: SHUFFLE ------------------
@@ -589,6 +601,9 @@ def main():
     # ------------------ STAGE 3: TRAIN ------------------
     save_progress("train", 0)
     print(f"\n[Round {round_no}] [3/5] [Train] Initiating PyTorch training...", flush=True)
+    tr_metrics = StageMetrics(round_no, "train") if _HAS_METRICS else None
+    if tr_metrics:
+        tr_metrics.start()
     train_log = logs_dir / f"round_{round_no}_train.log"
     print(f"  -> Verbose logs streaming to: {train_log}", flush=True)
     
@@ -628,6 +643,9 @@ def main():
             f.write("Mock PyTorch training completed successfully. model.ckpt saved.\n")
             
     save_progress("train", 100)
+    if tr_metrics:
+        tr_metrics.finish(tr_kind=args.tr_kind, tr_batch=args.tr_batch, tr_lr=args.tr_lr, tr_epochs=args.tr_epochs)
+        tr_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [3/5] [Train] Complete.", flush=True)
 
     # ------------------ STAGE 4: EXPORT ------------------
@@ -669,6 +687,9 @@ def main():
     # ------------------ STAGE 5: AUTOMATED PK ------------------
     save_progress("pk", 0)
     print(f"\n[Round {round_no}] [5/5] [PK] Initiating Headless Arena model evaluation...", flush=True)
+    pk_metrics = StageMetrics(round_no, "pk") if _HAS_METRICS else None
+    if pk_metrics:
+        pk_metrics.start()
     pk_log = logs_dir / f"round_{round_no}_pk.log"
     print(f"  -> Verbose logs streaming to: {pk_log}", flush=True)
     
@@ -686,9 +707,22 @@ def main():
         if runner_script.exists():
             # Run two rounds to ensure color balance
             half_games = max(1, args.pk_games // 2)
-            
+
+            # Use task ID to avoid conflicts with orphan processes from killed runs
+            pk_task_id = f"r{round_no}_{int(time.time())}"
+            out1 = data_dir / f"pk_sub1_{pk_task_id}.json"
+            out2 = data_dir / f"pk_sub2_{pk_task_id}.json"
+
+            # Clean stale PK results from prior rounds
+            for stale in data_dir.glob("pk_sub*.json"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+            print(f"  [PK] Task ID: {pk_task_id}", flush=True)
+
             # Sub-round 1: Candidate is White, Best Model is Black
-            out1 = data_dir / "pk_sub1.json"
             cmd1 = [
                 _find_python(), str(runner_script),
                 "--black-model", str(GAME_MODEL_PATH),
@@ -699,9 +733,8 @@ def main():
                 "--output", str(out1)
             ]
             ok1 = run_subprocess_redirected(cmd1, pk_log)
-            
+
             # Sub-round 2: Candidate is Black, Best Model is White
-            out2 = data_dir / "pk_sub2.json"
             cmd2 = [
                 _find_python(), str(runner_script),
                 "--black-model", str(candidate_gz_path),
@@ -715,11 +748,11 @@ def main():
             with open(pk_log, "a", encoding="utf-8") as f:
                 f.write("\n--- Sub-Round 2 (Dynamic Color Swap) ---\n")
             ok2 = run_subprocess_redirected(cmd2, pk_log, mode="a")
-            
+
             # Calculate winrate from JSON outputs
             wins_new = 0
             losses_new = 0
-            
+
             try:
                 _MAX_JSON_SIZE = 50 * 1024 * 1024  # 50MB
                 if out1.exists():
@@ -736,7 +769,7 @@ def main():
                         r2 = json.loads(out2.read_text(encoding="utf-8"))
                         wins_new += r2["summary"]["black_wins"]
                         losses_new += r2["summary"]["white_wins"]
-                
+
                 total_pk = wins_new + losses_new
                 winrate = wins_new / total_pk if total_pk > 0 else 0.0
             except Exception as e:
@@ -753,6 +786,9 @@ def main():
                 f.write(f"Mock PK complete. Candidate winrate: {winrate:.2%}\n")
                 
     save_progress("pk", 100)
+    if pk_metrics:
+        pk_metrics.finish(pk_games=args.pk_games, pk_visits_b=args.pk_visits_b, pk_visits_w=args.pk_visits_w, winrate=winrate)
+        pk_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [5/5] [PK] Result: Candidate Model wins {wins_new}/{args.pk_games} (Winrate: {winrate:.2%})", flush=True)
     
     # ------------------ DECISION: PROMOTION ------------------
