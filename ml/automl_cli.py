@@ -740,6 +740,7 @@ def main():
                 if pk_out.exists():
                     if pk_out.stat().st_size > _MAX_JSON_SIZE:
                         print(f"Warning: {pk_out} exceeds 50MB limit, skipping", file=sys.stderr)
+                        winrate = 0.5
                     else:
                         r = json.loads(pk_out.read_text(encoding="utf-8"))
                         wins_new = r["summary"]["candidate_wins"]
@@ -748,8 +749,6 @@ def main():
                         winrate = wins_new / total_pk if total_pk > 0 else 0.0
                         print(f"  [PK] Result: candidate={wins_new} baseline={losses_new} total={total_pk}", flush=True)
                         print(f"  [PK] Color split: cand_black={r['summary'].get('candidate_black_wins',0)} cand_white={r['summary'].get('candidate_white_wins',0)}", flush=True)
-                    else:
-                        winrate = 0.5
                 else:
                     winrate = 0.5
             except Exception as e:
