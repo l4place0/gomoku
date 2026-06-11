@@ -138,6 +138,39 @@ The 7-round stabilization plan fixed critical infrastructure bugs and validated 
    - `tr_epochs=1`, `tr_lr=0.0005`, `sf_games=600`, `sf_visits=96`, `pk_games=100`
    - 81% 胜率（R8），从 v3 R3（61.5%）提升 20 个百分点
 
+## 🧠 Insights from v4-stabilize R9-R10 (2026-06-10)
+
+The 2-round follow-up plan validated lr=0.0005 + epochs=2 and exposed critical PK evaluation bugs:
+
+1. **PK 评估缓存 bug 导致假胜率**:
+   - `automl_cli.py` PK 失败时不清理旧 `pk_sub*.json`，误读 R8 缓存结果
+   - R8 的 81%、R9 的 81%、R10 的 81% 全部是假数据（同一个 JSON 文件）
+   - **修复**: PK 运行前强制删除旧 JSON；永远检查 PK 日志确认评估真正执行
+   - **教训**: PK 胜率数字不可盲信，必须验证 pk_sub*.json 时间戳和 PK 日志内容
+
+2. **workspace reorg 后 4 个路径 bug**:
+   - `mlevo_cli.py`: subprocess 缺少 `cwd=str(BASE_DIR)` → automl_cli.py 找不到
+   - `headless_runner.py`: `from ml.verify_opening_book` import 失败（ml 包不在 path）
+   - `ai_worker.py`: 路径安全检查用 `BASE_DIR`（tools/）拒绝 ml/data/ 下的模型路径
+   - `automl_cli.py`: PK 失败时读取旧 JSON 缓存
+   - **教训**: 目录重组后必须跑一次完整 PK 端到端验证
+
+3. **lr=0.0005 + epochs=2 有效但需累积**:
+   - R9: 48.84% 未晋升（从 R8 checkpoint 重新训练，vloss 0.911）
+   - R10: 72.92% 晋升（从 R9 checkpoint 继续，vloss 0.886 — 分支最低值）
+   - 两轮累积训练后模型真实超越 R8 基线
+   - **建议**: lr=0.0005 + epochs=2 需要至少 2 轮才能见效
+
+4. **对称 pk_visits 消除颜色偏差**:
+   - 修复前: 执黑 50-0 全胜，执白 0-50 全负（128/64 不对称 visits）
+   - 修复后 R10: 执白 38-8-4，执黑 32-18-0（128/128 对称 visits）
+   - **建议**: pk_visits_b 和 pk_visits_w 必须相等
+
+5. **最佳参数组合 (v4-stabilize)**:
+   - `tr_epochs=2`, `tr_lr=0.0005`, `sf_games=800`, `sf_visits=128`, `sh_samples=50000`
+   - `pk_games=100`, `pk_visits_b=128`, `pk_visits_w=128`, `pk_threshold=0.58`
+   - R10 真实胜率 72.92%（vloss 0.886，pacc1 49.7%）
+
 ## 🧠 Insights from gtx1060-b10c128-evolution (2026-05-28)
 
 The completed 5-round evolution plan on a local GTX 1650 Ti GPU provided critical operational insights:
@@ -150,4 +183,53 @@ The completed 5-round evolution plan on a local GTX 1650 Ti GPU provided critica
 3. **Weight Promotion Guardrail**:
    - The Round 4 candidate achieved an outstanding **75.00% winrate** in the PK Arena, proving that the adaptive parameter adjustments (SWA, LR decays) are highly effective.
    - The Round 5 candidate scored exactly **50.00% winrate**, which triggered the $\ge 55\%$ promotion guardrail and prevented regression, demonstrating the robustness of the headless PK evaluation logic.
+
+## 🧠 Insights from b10c256nbt-validation (2026-06-11)
+
+The 3-round validation of b10c256nbt (6.49M params) on GTX 1650 Ti (4GB VRAM, 7.7GB RAM WSL2) revealed critical constraints:
+
+1. **VRAM is NOT the bottleneck**:
+   - b10c256nbt training (batch=64): peak VRAM 1.3GB, well within 4GB limit
+   - b10c256nbt training (batch=128): peak VRAM 2.0GB, still safe
+   - Dry-run confirmed: batch=64 recommended, batch=128 possible
+
+2. **RAM IS the bottleneck (WSL2 crash risk)**:
+   - PK stage: RAM peak 7.3GB / 7.7GB WSL2 limit → multiple WSL crashes
+   - Root cause: headless_runner.py loads two model copies (DLL + subprocess)
+   - **Safe PK limit: pk_games=10, pk_visits=32** (RAM ~5GB)
+   - **Dangerous: pk_games=100, pk_visits=96** (RAM 7.3GB, crash risk)
+
+3. **Data volume critical for larger models**:
+   - sh_samples=10K produced only 1 training step per round
+   - b10c256nbt's 6.49M params need 50K+ rows to learn effectively
+   - R1 (best): vloss=0.882, pacc1=36.9%
+   - R2/R3 (10K rows): vloss regressed to 0.941-0.948
+
+4. **Value head saturation at low data**:
+   - vloss improved in R1 (0.882) but regressed in R2/R3
+   - Policy head improved: pacc1 36.9% → 43.8%
+   - Model learns policy but overfits value at 10K rows
+
+5. **Selfplay throughput (b10c256nbt, sf_visits=64)**:
+   - 200 games × 64 visits × 8 threads ≈ 30 min
+   - ~40% slower than b10c128 at same visits
+
+6. **Training throughput (b10c256nbt, batch=64)**:
+   - Step time: 47-95s (thermal throttling)
+   - ~4x slower than b10c128 (16s/step)
+
+7. **PK engineering improvements implemented**:
+   - Single-process alternating colors (replaces two sub-rounds)
+   - SPRT early termination (stops when result is decisive)
+   - Task ID for PK output files (prevents orphan conflicts)
+   - Passive metrics collector (StageMetrics in automl_cli.py)
+
+8. **Recommended parameters for b10c256nbt**:
+   - `tr_batch`: 64 (safe), 128 (possible)
+   - `tr_lr`: 0.001 (KataGo community recommendation)
+   - `sh_samples`: 50000+ (minimum for effective learning)
+   - `sf_games`: 800+ (sufficient data per round)
+   - `sf_visits`: 64-96 (throughput vs quality tradeoff)
+   - `pk_games`: 10-30 (RAM safe)
+   - `pk_visits`: 32 (RAM safe)
 
