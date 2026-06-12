@@ -15,7 +15,10 @@ import shutil
 import gzip
 import platform
 import time
+import threading
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict
 
 try:
     from ml.benchmark.metrics_collector import StageMetrics
@@ -61,6 +64,32 @@ def win_path(p):
         rest = s[6:].replace("/", "\\")
         return f"{drive}:{rest}"
     return s
+
+
+def get_vram_usage():
+    """Get current GPU VRAM usage in MiB. Returns (used, total) or (0, 0) on error."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(",")
+            used = int(parts[0].replace("MiB", "").strip())
+            total = int(parts[1].replace("MiB", "").strip())
+            return used, total
+    except Exception:
+        pass
+    return 0, 0
+
+
+def check_vram_safety(margin_mb=512):
+    """Check if VRAM has enough margin. Returns True if safe."""
+    used, total = get_vram_usage()
+    if total == 0:
+        return True  # Can't check, assume safe
+    remaining = total - used
+    return remaining >= margin_mb
 DEFAULT_DATA_DIR = BASE_DIR / "data" / "training_data"
 LOG_DIR = BASE_DIR / "data" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -84,6 +113,7 @@ def create_parser():
     
     # Global Configs
     parser.add_argument("--round", type=int, default=1, help="Current generation round / iteration")
+    parser.add_argument("--serial", action="store_true", default=False, help="Run pipeline stages sequentially (default: parallel)")
     parser.add_argument("--model-name", type=str, default="b10c256nbt", help="Model name identifier")
     parser.add_argument("--gpu", type=int, default=0, help="CUDA GPU device index")
     parser.add_argument("--data-dir", type=str, default=str(DEFAULT_DATA_DIR), help="Directory to store training data")
@@ -117,6 +147,7 @@ def create_parser():
     parser.add_argument("--sh-approx-rows-per-file", type=int, default=50000, help="Approximate rows per shuffle output file")
 
     # Selfplay MCTS parameters
+    parser.add_argument("--sf-nn-max-batch-size", type=int, default=0, help="Max batch size for NN inference (0=use tr-batch)")
     parser.add_argument("--sf-max-moves", type=int, default=400, help="Max moves per selfplay game")
     parser.add_argument("--sf-rules", type=str, default="FREESTYLE", help="Game rules (FREESTYLE, STANDARD, RENJU, CARO)")
     parser.add_argument("--sf-temp-early", type=float, default=0.75, help="Chosen move temperature early")
@@ -201,6 +232,53 @@ def format_evidence_chain(args):
 
 def evaluate_promotion(winrate, threshold):
     return winrate >= threshold
+
+class BackgroundService:
+    """Runs a subprocess in a background thread with auto-restart."""
+
+    def __init__(self, name, cmd, log_file, interval=20, pre_run=None):
+        self.name = name
+        self.cmd = cmd
+        self.log_file = Path(log_file)
+        self.interval = interval
+        self._pre_run = pre_run  # Optional callback before each run
+        self._thread = None
+        self._stop = threading.Event()
+        self._proc = None
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name=f"bg-{self.name}")
+        self._thread.start()
+        print(f"  [BG] Started {self.name} service", flush=True)
+
+    def stop(self):
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        if self._thread:
+            self._thread.join(timeout=10)
+        print(f"  [BG] Stopped {self.name} service", flush=True)
+
+    def _run_loop(self):
+        while not self._stop.is_set():
+            try:
+                if self._pre_run:
+                    self._pre_run()
+                self.log_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.log_file, "a", encoding="utf-8", errors="ignore") as f:
+                    self._proc = subprocess.Popen(
+                        self.cmd, stdout=f, stderr=subprocess.STDOUT, text=True
+                    )
+                    self._proc.wait()
+            except Exception as e:
+                print(f"  [BG] {self.name} error: {e}", file=sys.stderr, flush=True)
+            self._stop.wait(self.interval)
+
 
 def run_subprocess_redirected(cmd, log_file_path, env=None, mode="w"):
     try:
@@ -431,32 +509,18 @@ def mine_high_winrate_openings(data_dir):
             
     print(f"[Miner] Done. Appended/updated {count} high-winrate openings in {book_path}.")
 
-def main():
-    parser = create_parser()
-    args = parser.parse_args()
-    
-    # 1. Print param evidence chain
-    evidence_chain = format_evidence_chain(args)
-    print(evidence_chain, flush=True)
-    
-    data_dir = Path(args.data_dir)
-    logs_dir = LOG_DIR
-    
-    # Initialize necessary dirs
-    for d in [
-        data_dir,
-        data_dir / "selfplay",
-        data_dir / "models",
-        data_dir / "shuffleddata" / "current",
-        data_dir / "torchmodels_toexport",
-        data_dir / "models_exported",
-        data_dir / "shuffle_tmp",
-    ]:
-        d.mkdir(parents=True, exist_ok=True)
-        
-    round_no = args.round
-    
-    # ------------------ STAGE 1: SELFPLAY ------------------
+@dataclass
+class StageResult:
+    """Result of a pipeline stage execution."""
+    success: bool
+    duration: float
+    log_file: Path
+    error: str = ""
+
+
+def run_selfplay(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute selfplay stage."""
+    start_time = time.time()
     save_progress("selfplay", 0)
     print(f"\n[Round {round_no}] [1/5] [Selfplay] Generating {args.sf_games} selfplay games...", flush=True)
     sp_metrics = StageMetrics(round_no, "selfplay") if _HAS_METRICS else None
@@ -479,7 +543,8 @@ def main():
             print(f"  -> [Warn] Opening selection failed: {opening_proc.stderr}", flush=True)
 
     # Synchronize config keys
-    sync_native_runtime_cfg(cfg_path, args.gpu, args.sf_threads, args.sf_visits, args.tr_batch,
+    nn_batch = args.sf_nn_max_batch_size if args.sf_nn_max_batch_size > 0 else args.tr_batch
+    sync_native_runtime_cfg(cfg_path, args.gpu, args.sf_threads, args.sf_visits, nn_batch,
                             pos_len=args.tr_pos_len, max_moves=args.sf_max_moves, rules=args.sf_rules,
                             temp_early=args.sf_temp_early, temp_halflife=args.sf_temp_halflife, temp_late=args.sf_temp_late,
                             policy_temp_early=args.sf_policy_temp_early, policy_temp=args.sf_policy_temp,
@@ -487,10 +552,10 @@ def main():
                             dirichlet_weight=args.sf_dirichlet_weight, dirichlet_concentration=args.sf_dirichlet_concentration,
                             policy_init_temp=args.sf_policy_init_temp, policy_init_avg_move=args.sf_policy_init_avg_move,
                             resign_threshold=args.sf_resign_threshold, resign_consec=args.sf_resign_consec)
-    
+
     selfplay_log = logs_dir / f"round_{round_no}_selfplay.log"
     print(f"  -> Verbose logs streaming to: {selfplay_log}", flush=True)
-    
+
     # If the engine actually exists, run it
     if engine_path.exists():
         cmd = [
@@ -504,25 +569,29 @@ def main():
         ok = run_subprocess_redirected(cmd, selfplay_log, env=env)
         if not ok:
             print("[Error] Selfplay stage exited with errors! Please check selfplay log.", file=sys.stderr)
-            sys.exit(1)
+            return StageResult(False, time.time() - start_time, selfplay_log, "Selfplay failed")
     else:
         # Mock run if files do not exist (useful for test environments)
         print(f"  [Mock] {engine_name} engine not found. Simulating mock selfplay data generation...", flush=True)
         with open(selfplay_log, "w", encoding="utf-8") as f:
             f.write("Mock selfplay completed successfully\n")
-            
+
     save_progress("selfplay", 100)
     if sp_metrics:
         sp_metrics.finish(sf_games=args.sf_games, sf_visits=args.sf_visits, sf_threads=args.sf_threads)
         sp_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [1/5] [Selfplay] Complete.", flush=True)
-    
-    # ------------------ STAGE 2: SHUFFLE ------------------
+    return StageResult(True, time.time() - start_time, selfplay_log)
+
+
+def run_shuffle(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute shuffle stage."""
+    start_time = time.time()
     save_progress("shuffle", 0)
     print(f"\n[Round {round_no}] [2/5] [Shuffle] Shuffling samples (min {args.sh_samples})...", flush=True)
     shuffle_log = logs_dir / f"round_{round_no}_shuffle.log"
     print(f"  -> Verbose logs streaming to: {shuffle_log}", flush=True)
-    
+
     shuffle_script = KATA_ROOT / "python" / "shuffle.py"
     if shuffle_script.exists():
         # Clear old output and temp directories as shuffle.py expects them to not exist
@@ -534,11 +603,11 @@ def main():
         ]:
             if old_dir.exists():
                 shutil.rmtree(old_dir)
-                
+
         # Recreate the parent temporary directories because shuffle.py expects them to exist
         (data_dir / "shuffle_tmp" / "train").mkdir(parents=True, exist_ok=True)
         (data_dir / "shuffle_tmp" / "val").mkdir(parents=True, exist_ok=True)
-                
+
         train_cmd = [
             _find_python(), str(shuffle_script),
             str(data_dir / "selfplay"),
@@ -571,19 +640,19 @@ def main():
         with open(shuffle_log, "a", encoding="utf-8") as f:
             f.write("\n--- Validation Shuffling ---\n")
         ok_val = run_subprocess_redirected(val_cmd, shuffle_log, mode="a")
-        
+
         if not ok_train or not ok_val:
             print("[Warning] Shuffling encountered errors (might be due to empty selfplay npz). Check logs.", file=sys.stderr)
-            
+
         # Self-healing: if val dataset is empty or val.json has no npz files, copy train to val
         train_npz = data_dir / "shuffleddata" / "current" / "train" / "data0.npz"
         val_npz = data_dir / "shuffleddata" / "current" / "val" / "data0.npz"
         val_json = data_dir / "shuffleddata" / "current" / "val.json"
-        
+
         val_npz_exists = False
         if val_npz.parent.exists():
             val_npz_exists = any(val_npz.parent.glob("*.npz"))
-            
+
         if train_npz.exists() and not val_npz_exists:
             val_npz.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(train_npz, val_npz)
@@ -594,11 +663,15 @@ def main():
         print("  [Mock] shuffle.py not found. Simulating data shuffling...", flush=True)
         with open(shuffle_log, "w") as f:
             f.write("Mock shuffling complete.\n")
-            
+
     save_progress("shuffle", 100)
     print(f"[Round {round_no}] [2/5] [Shuffle] Complete.", flush=True)
+    return StageResult(True, time.time() - start_time, shuffle_log)
 
-    # ------------------ STAGE 3: TRAIN ------------------
+
+def run_train(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute training stage."""
+    start_time = time.time()
     save_progress("train", 0)
     print(f"\n[Round {round_no}] [3/5] [Train] Initiating PyTorch training...", flush=True)
     tr_metrics = StageMetrics(round_no, "train") if _HAS_METRICS else None
@@ -606,7 +679,7 @@ def main():
         tr_metrics.start()
     train_log = logs_dir / f"round_{round_no}_train.log"
     print(f"  -> Verbose logs streaming to: {train_log}", flush=True)
-    
+
     train_script = KATA_ROOT / "python" / "train.py"
     if train_script.exists():
         train_cmd = [
@@ -641,24 +714,28 @@ def main():
         (chk_dir / "model.ckpt").write_text("mock weights checkpoint", encoding="utf-8")
         with open(train_log, "w") as f:
             f.write("Mock PyTorch training completed successfully. model.ckpt saved.\n")
-            
+
     save_progress("train", 100)
     if tr_metrics:
         tr_metrics.finish(tr_kind=args.tr_kind, tr_batch=args.tr_batch, tr_lr=args.tr_lr, tr_epochs=args.tr_epochs)
         tr_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [3/5] [Train] Complete.", flush=True)
+    return StageResult(True, time.time() - start_time, train_log)
 
-    # ------------------ STAGE 4: EXPORT ------------------
+
+def run_export(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute model export stage."""
+    start_time = time.time()
     save_progress("export", 0)
     print(f"\n[Round {round_no}] [4/5] [Export] Exporting candidate weights...", flush=True)
     export_log = logs_dir / f"round_{round_no}_export.log"
     print(f"  -> Verbose logs streaming to: {export_log}", flush=True)
-    
+
     export_script = KATA_ROOT / "python" / "export_model_pytorch.py"
     candidate_gz_dir = data_dir / "models_exported" / args.model_name
     candidate_gz_dir.mkdir(parents=True, exist_ok=True)
     candidate_gz_path = candidate_gz_dir / "model.bin.gz"
-    
+
     checkpoint = find_latest_checkpoint(data_dir)
     if export_script.exists() and checkpoint is not None:
         cmd = [
@@ -680,11 +757,15 @@ def main():
         candidate_gz_path.write_text("mock binary weights gz", encoding="utf-8")
         with open(export_log, "w") as f:
             f.write("Mock export successful. gzipped weights ready.\n")
-            
+
     save_progress("export", 100)
     print(f"[Round {round_no}] [4/5] [Export] Complete.", flush=True)
+    return StageResult(True, time.time() - start_time, export_log)
 
-    # ------------------ STAGE 5: AUTOMATED PK ------------------
+
+def run_pk(args, data_dir: Path, logs_dir: Path, round_no: int, candidate_gz_path: Path) -> StageResult:
+    """Execute PK evaluation stage."""
+    start_time = time.time()
     save_progress("pk", 0)
     print(f"\n[Round {round_no}] [5/5] [PK] Initiating Headless Arena model evaluation...", flush=True)
     pk_metrics = StageMetrics(round_no, "pk") if _HAS_METRICS else None
@@ -692,11 +773,10 @@ def main():
         pk_metrics.start()
     pk_log = logs_dir / f"round_{round_no}_pk.log"
     print(f"  -> Verbose logs streaming to: {pk_log}", flush=True)
-    
+
     runner_script = PROJECT_ROOT / "tools" / "headless_runner.py"
-    
     best_model_exists = GAME_MODEL_PATH.exists()
-    
+
     if not best_model_exists:
         print("  [PK] No current active best model found. Auto-promoting candidate immediately!", flush=True)
         winrate = 1.0
@@ -763,12 +843,165 @@ def main():
             losses_new = args.pk_games - wins_new
             with open(pk_log, "w") as f:
                 f.write(f"Mock PK complete. Candidate winrate: {winrate:.2%}\n")
-                
+
     save_progress("pk", 100)
     if pk_metrics:
         pk_metrics.finish(pk_games=args.pk_games, pk_visits_b=args.pk_visits_b, pk_visits_w=args.pk_visits_w, winrate=winrate)
         pk_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [5/5] [PK] Result: Candidate Model wins {wins_new}/{args.pk_games} (Winrate: {winrate:.2%})", flush=True)
+
+    # Store PK results in the result for later use
+    result = StageResult(True, time.time() - start_time, pk_log)
+    result._pk_winrate = winrate
+    result._pk_wins = wins_new
+    result._pk_losses = losses_new
+    return result
+
+
+def run_pipeline(args, data_dir: Path, logs_dir: Path, round_no: int, serial: bool = True) -> Dict[str, StageResult]:
+    """Execute the full training pipeline.
+
+    Args:
+        args: Parsed CLI arguments
+        data_dir: Data directory path
+        logs_dir: Logs directory path
+        round_no: Current round number
+        serial: If True, run stages sequentially. If False, run selfplay+train in parallel.
+
+    Returns:
+        Dict mapping stage names to StageResult.
+    """
+    results = {}
+
+    if serial:
+        # Serial mode: run stages one by one
+        results["selfplay"] = run_selfplay(args, data_dir, logs_dir, round_no)
+        if not results["selfplay"].success:
+            return results
+
+        results["shuffle"] = run_shuffle(args, data_dir, logs_dir, round_no)
+        results["train"] = run_train(args, data_dir, logs_dir, round_no)
+        results["export"] = run_export(args, data_dir, logs_dir, round_no)
+        candidate_gz_path = data_dir / "models_exported" / args.model_name / "model.bin.gz"
+        results["pk"] = run_pk(args, data_dir, logs_dir, round_no, candidate_gz_path)
+    else:
+        # Parallel mode: start shuffle/export as background services
+        # Check VRAM safety before starting parallel execution
+        if not check_vram_safety(margin_mb=512):
+            used, total = get_vram_usage()
+            print(f"[Warning] VRAM low ({used}/{total} MiB). Falling back to serial mode.", flush=True)
+            return run_pipeline(args, data_dir, logs_dir, round_no, serial=True)
+
+        shuffle_script = KATA_ROOT / "python" / "shuffle.py"
+        export_script = KATA_ROOT / "python" / "export_model_pytorch.py"
+
+        bg_services = []
+
+        # Start shuffle background service
+        if shuffle_script.exists():
+            # Clear old shuffle output directories
+            for old_dir in [
+                data_dir / "shuffleddata" / "current" / "train",
+                data_dir / "shuffleddata" / "current" / "val",
+                data_dir / "shuffle_tmp" / "train",
+                data_dir / "shuffle_tmp" / "val",
+            ]:
+                if old_dir.exists():
+                    shutil.rmtree(old_dir)
+            (data_dir / "shuffle_tmp" / "train").mkdir(parents=True, exist_ok=True)
+            (data_dir / "shuffle_tmp" / "val").mkdir(parents=True, exist_ok=True)
+
+            shuffle_log = logs_dir / f"round_{round_no}_shuffle_bg.log"
+            shuffle_cmd = [
+                _find_python(), str(shuffle_script),
+                str(data_dir / "selfplay"),
+                "-expand-window-per-row", str(args.sh_expand_window_per_row),
+                "-taper-window-exponent", str(args.sh_taper_window_exponent),
+                "-out-dir", str(data_dir / "shuffleddata" / "current" / "train"),
+                "-out-tmp-dir", str(data_dir / "shuffle_tmp" / "train"),
+                "-approx-rows-per-out-file", str(args.sh_approx_rows_per_file),
+                "-num-processes", str(args.sh_threads),
+                "-batch-size", str(args.tr_batch),
+                "-min-rows", str(args.sh_samples),
+                "-keep-target-rows", str(args.sh_samples),
+                "-output-npz",
+            ]
+
+            def clear_shuffle_dirs():
+                for d in [data_dir / "shuffleddata" / "current" / "train",
+                          data_dir / "shuffle_tmp" / "train"]:
+                    if d.exists():
+                        shutil.rmtree(d)
+                (data_dir / "shuffle_tmp" / "train").mkdir(parents=True, exist_ok=True)
+
+            svc = BackgroundService("shuffle", shuffle_cmd, shuffle_log, interval=20, pre_run=clear_shuffle_dirs)
+            svc.start()
+            bg_services.append(svc)
+
+        # Run selfplay (blocking)
+        results["selfplay"] = run_selfplay(args, data_dir, logs_dir, round_no)
+        if not results["selfplay"].success:
+            for svc in bg_services:
+                svc.stop()
+            return results
+
+        # Run train (blocking, but shuffle runs in background)
+        results["train"] = run_train(args, data_dir, logs_dir, round_no)
+
+        # Stop background services
+        for svc in bg_services:
+            svc.stop()
+
+        # Run shuffle once more to ensure final data is ready
+        results["shuffle"] = run_shuffle(args, data_dir, logs_dir, round_no)
+
+        # Export
+        results["export"] = run_export(args, data_dir, logs_dir, round_no)
+        candidate_gz_path = data_dir / "models_exported" / args.model_name / "model.bin.gz"
+
+        # PK
+        results["pk"] = run_pk(args, data_dir, logs_dir, round_no, candidate_gz_path)
+
+    return results
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+
+    # 1. Print param evidence chain
+    evidence_chain = format_evidence_chain(args)
+    print(evidence_chain, flush=True)
+
+    data_dir = Path(args.data_dir)
+    logs_dir = LOG_DIR
+
+    # Initialize necessary dirs
+    for d in [
+        data_dir,
+        data_dir / "selfplay",
+        data_dir / "models",
+        data_dir / "shuffleddata" / "current",
+        data_dir / "torchmodels_toexport",
+        data_dir / "models_exported",
+        data_dir / "shuffle_tmp",
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    round_no = args.round
+
+    # ------------------ PIPELINE EXECUTION ------------------
+    results = run_pipeline(args, data_dir, logs_dir, round_no, serial=args.serial)
+
+    # Check for failures
+    if "selfplay" in results and not results["selfplay"].success:
+        print(f"[Error] Selfplay failed: {results['selfplay'].error}", file=sys.stderr)
+        sys.exit(1)
+
+    pk_result = results.get("pk")
+    winrate = getattr(pk_result, '_pk_winrate', 0.5) if pk_result else 0.5
+    wins_new = getattr(pk_result, '_pk_wins', 0) if pk_result else 0
+    losses_new = getattr(pk_result, '_pk_losses', 0) if pk_result else 0
     
     # ------------------ DECISION: PROMOTION ------------------
     promoted = evaluate_promotion(winrate, args.pk_threshold)

@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 LOG_DIR = BASE_DIR / "data" / "logs"
 PLANS_DIR = PROJECT_ROOT / "docs" / "ml" / "plans"
 ARCHIVE_DIR = PLANS_DIR / "archive"
@@ -436,7 +437,7 @@ def cmd_run(args):
     save_progress("selfplay", 0, None)
 
     try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore", bufsize=1)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore", bufsize=1, cwd=str(BASE_DIR))
         for line in process.stdout:
             print(line, end="", flush=True)
         process.wait()
@@ -576,7 +577,7 @@ def cmd_pk(args):
         "--games", str(games),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, cwd=str(BASE_DIR))
         # Parse result from stdout
         pk_result = {"winner": branch_a, "winrate": 0.5, "games_played": games}
         try:
@@ -834,6 +835,229 @@ def cmd_list(args):
     _output({"active": active, "archived": archived}, True)
 
 
+def _parse_pk_log(log_path):
+    """Parse a round_*_pk.log file to extract game results and anomalies."""
+    result = {
+        "log_file": log_path.name,
+        "planned_games": 0,
+        "completed_games": 0,
+        "results": {"BLACK": 0, "WHITE": 0, "DRAW": 0},
+        "ipc_failures": 0,
+        "vcf_errors": 0,
+        "color_distribution": {"BLACK_win_pct": 0.0, "WHITE_win_pct": 0.0, "DRAW_pct": 0.0},
+        "verdict": "VALID",
+    }
+    if not log_path.exists():
+        result["verdict"] = "MISSING"
+        return result
+
+    text = log_path.read_text(errors="replace")
+
+    # Extract planned games from [Game N/M] pattern
+    planned_match = re.findall(r'\[Game \d+/(\d+)\]', text)
+    if planned_match:
+        result["planned_games"] = max(int(m) for m in planned_match)
+
+    # Count finished games and extract winners
+    finished = re.findall(r'Finished! Winner: (\w+)', text)
+    result["completed_games"] = len(finished)
+    for w in finished:
+        w_upper = w.upper()
+        if w_upper in result["results"]:
+            result["results"][w_upper] += 1
+
+    # Color distribution
+    total = result["completed_games"]
+    if total > 0:
+        result["color_distribution"]["BLACK_win_pct"] = round(result["results"]["BLACK"] / total * 100, 1)
+        result["color_distribution"]["WHITE_win_pct"] = round(result["results"]["WHITE"] / total * 100, 1)
+        result["color_distribution"]["DRAW_pct"] = round(result["results"]["DRAW"] / total * 100, 1)
+
+    # Anomalies
+    result["ipc_failures"] = text.count("IPC failed")
+    result["vcf_errors"] = text.count("zob_board not init")
+
+    # Verdict
+    if result["ipc_failures"] > 0:
+        result["verdict"] = "INVALID"
+    elif result["planned_games"] > 0 and result["completed_games"] < result["planned_games"] * 0.5:
+        result["verdict"] = "INVALID"
+    elif total > 0:
+        max_win_pct = max(result["color_distribution"]["BLACK_win_pct"], result["color_distribution"]["WHITE_win_pct"])
+        if max_win_pct > 70:
+            result["verdict"] = "DEGRADED"
+        elif result["planned_games"] > 0 and result["completed_games"] < result["planned_games"] * 0.8:
+            result["verdict"] = "DEGRADED"
+
+    return result
+
+
+def _parse_train_log(log_path):
+    """Parse a round_*_train.log file to extract training metrics."""
+    result = {"log_file": log_path.name, "vloss": None, "pacc1": None, "p0loss": None}
+    if not log_path.exists():
+        return {"log_file": log_path.name, "vloss": "MISSING", "pacc1": "MISSING", "p0loss": "MISSING"}
+
+    text = log_path.read_text(errors="replace")
+
+    # Find the last validation metrics line (contains p0loss, vloss, pacc1)
+    # Format: p0loss = 1.856951, ... vloss = 0.941201, ... pacc1 = 0.438301
+    val_lines = [line for line in text.split('\n') if 'p0loss' in line and 'vloss' in line and 'pacc1' in line]
+    if val_lines:
+        last_line = val_lines[-1]
+        p0loss_m = re.search(r'p0loss\s*=\s*([\d.]+)', last_line)
+        vloss_m = re.search(r'vloss\s*=\s*([\d.]+)', last_line)
+        pacc1_m = re.search(r'pacc1\s*=\s*([\d.]+)', last_line)
+        if p0loss_m:
+            result["p0loss"] = float(p0loss_m.group(1))
+        if vloss_m:
+            result["vloss"] = float(vloss_m.group(1))
+        if pacc1_m:
+            result["pacc1"] = round(float(pacc1_m.group(1)) * 100, 1)
+
+    return result
+
+
+def _read_ledger():
+    """Read evolution_ledger.json and return entries grouped by round."""
+    if not LEDGER_PATH.exists():
+        return []
+    try:
+        text = LEDGER_PATH.read_text()
+        entries = json.loads(text)
+        return entries if isinstance(entries, list) else []
+    except Exception:
+        return []
+
+
+def _check_ledger_consistency(pk_result, ledger_entry):
+    """Compare PK log results against ledger entry."""
+    if not ledger_entry:
+        return {"match": False, "detail": "No ledger entry found"}
+    log_wins = pk_result["results"]["BLACK"] + pk_result["results"]["WHITE"]
+    log_total = pk_result["completed_games"]
+    ledger_wins = ledger_entry.get("wins_new", 0)
+    ledger_losses = ledger_entry.get("losses_new", 0)
+    ledger_total = ledger_wins + ledger_losses
+    # Check if ledger says 0/0 but log has actual results
+    if ledger_wins == 0 and ledger_losses == 0 and log_total > 0:
+        return {"match": False, "detail": f"Ledger says 0/0 but log shows {log_total} games completed"}
+    # Check if totals roughly match (allow some tolerance for different log runs)
+    if ledger_total > 0 and log_total > 0 and abs(ledger_total - log_total) > max(5, log_total * 0.3):
+        return {"match": False, "detail": f"Ledger has {ledger_total} games but log has {log_total}"}
+    return {"match": True, "detail": ""}
+
+
+def cmd_report(args):
+    """Generate a structured fact report from training logs and ledger."""
+    plan_name = args.name
+    # Try active plans first, then archived
+    plan_dir = None
+    active_dir = PLANS_DIR / plan_name
+    if active_dir.exists() and active_dir.is_dir():
+        plan_dir = active_dir
+    else:
+        # Search archive
+        if ARCHIVE_DIR.exists():
+            for item in ARCHIVE_DIR.iterdir():
+                if item.is_dir() and plan_name in item.name:
+                    plan_dir = item
+                    break
+    if not plan_dir:
+        _error(f"Plan '{plan_name}' not found in active or archived plans")
+
+    # Read plan metadata
+    plan_json_path = plan_dir / "training_plan.json"
+    plan_meta = {}
+    if plan_json_path.exists():
+        try:
+            plan_meta = json.loads(plan_json_path.read_text())
+        except Exception:
+            pass
+
+    model_kind = plan_meta.get("model_kind", "unknown")
+
+    # Discover PK and train logs
+    pk_logs = sorted(LOG_DIR.glob("round_*_pk.log"), key=lambda p: int(re.search(r'round_(\d+)', p.name).group(1)) if re.search(r'round_(\d+)', p.name) else 0)
+    train_logs = sorted(LOG_DIR.glob("round_*_train.log"), key=lambda p: int(re.search(r'round_(\d+)', p.name).group(1)) if re.search(r'round_(\d+)', p.name) else 0)
+
+    # Read ledger
+    ledger_entries = _read_ledger()
+
+    # Build per-round data
+    rounds = []
+    anomalies = []
+
+    # Group ledger entries by round for this plan's model_kind
+    ledger_by_round = {}
+    for entry in ledger_entries:
+        entry_kind = entry.get("params", {}).get("model_name", entry.get("params", {}).get("tr_kind", ""))
+        if entry_kind == model_kind or model_kind == "unknown":
+            r = entry.get("round")
+            if r is not None:
+                ledger_by_round[r] = entry
+
+    # Parse all PK logs
+    pk_by_round = {}
+    for log_path in pk_logs:
+        m = re.search(r'round_(\d+)', log_path.name)
+        if m:
+            round_num = int(m.group(1))
+            parsed = _parse_pk_log(log_path)
+            pk_by_round[round_num] = parsed
+
+    # Parse all train logs
+    train_by_round = {}
+    for log_path in train_logs:
+        m = re.search(r'round_(\d+)', log_path.name)
+        if m:
+            round_num = int(m.group(1))
+            parsed = _parse_train_log(log_path)
+            train_by_round[round_num] = parsed
+
+    # Combine into rounds
+    all_rounds = sorted(set(list(pk_by_round.keys()) + list(train_by_round.keys()) + list(ledger_by_round.keys())))
+    for round_num in all_rounds:
+        pk = pk_by_round.get(round_num, {"verdict": "MISSING", "planned_games": 0, "completed_games": 0, "results": {"BLACK": 0, "WHITE": 0, "DRAW": 0}, "ipc_failures": 0, "vcf_errors": 0, "color_distribution": {}})
+        train = train_by_round.get(round_num, {"vloss": "MISSING", "pacc1": "MISSING", "p0loss": "MISSING"})
+        ledger = ledger_by_round.get(round_num)
+        ledger_check = _check_ledger_consistency(pk, ledger) if pk["verdict"] != "MISSING" else {"match": True, "detail": ""}
+
+        round_data = {
+            "round": round_num,
+            "training": train,
+            "pk": pk,
+            "ledger": {
+                "wins_new": ledger.get("wins_new") if ledger else None,
+                "losses_new": ledger.get("losses_new") if ledger else None,
+                "winrate": ledger.get("winrate") if ledger else None,
+                "promoted": ledger.get("promoted") if ledger else None,
+            } if ledger else None,
+            "ledger_match": ledger_check["match"],
+            "mismatch_detail": ledger_check["detail"],
+        }
+        rounds.append(round_data)
+
+        # Collect anomalies
+        if pk.get("ipc_failures", 0) > 0:
+            anomalies.append(f"R{round_num}: IPC failures {pk['ipc_failures']}x")
+        if pk.get("vcf_errors", 0) > 0:
+            anomalies.append(f"R{round_num}: VCF solver errors {pk['vcf_errors']}x")
+        if pk.get("verdict") == "INVALID":
+            anomalies.append(f"R{round_num}: PK INVALID (completed {pk['completed_games']}/{pk['planned_games']})")
+        if not ledger_check["match"]:
+            anomalies.append(f"R{round_num}: Ledger mismatch — {ledger_check['detail']}")
+
+    report = {
+        "plan_name": plan_name,
+        "model_kind": model_kind,
+        "plan_dir": str(plan_dir),
+        "rounds": rounds,
+        "anomalies": anomalies,
+    }
+    _output(report, True)
+
+
 def cmd_archive(args):
     """Archive a completed plan."""
     plan_name, plan_dir = find_plan(args.name)
@@ -1028,6 +1252,10 @@ def main():
     archive_p = subparsers.add_parser("archive", help="Archive plan")
     archive_p.add_argument("name", type=str)
 
+    # report
+    report_p = subparsers.add_parser("report", help="Generate structured fact report from logs")
+    report_p.add_argument("name", type=str, help="Plan name")
+
     sync_p = subparsers.add_parser("sync", help="Sync models to Google Drive")
     sync_p.add_argument("--dry-run", action="store_true", help="Preview without uploading")
 
@@ -1053,6 +1281,7 @@ def main():
         "new": cmd_new,
         "list": cmd_list,
         "archive": cmd_archive,
+        "report": cmd_report,
         "sync": cmd_sync,
         "plans": cmd_plans,
         "plan": cmd_plan_detail,
