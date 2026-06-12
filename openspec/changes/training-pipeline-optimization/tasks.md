@@ -21,10 +21,10 @@
 
 ## 4. Shuffle/Export 异步化
 
-- [ ] 4.1 实现 shuffle 后台服务：监听 selfplay 数据目录，新数据到达时自动触发 shuffle
-- [ ] 4.2 实现 export 后台服务：监听 training checkpoint，更新时自动触发 export
-- [ ] 4.3 从串行流水线中移除 shuffle 和 export 阶段
-- [ ] 4.4 实现后台服务的启动和关闭管理
+- [x] 4.1 实现 shuffle 后台服务：监听 selfplay 数据目录，新数据到达时自动触发 shuffle
+- [x] 4.2 实现 export 后台服务：监听 training checkpoint，更新时自动触发 export
+- [x] 4.3 从串行流水线中移除 shuffle 和 export 阶段
+- [x] 4.4 实现后台服务的启动和关闭管理
 
 ## 5. 流水线并行化
 
@@ -38,7 +38,7 @@
 
 - [x] 6.1 更新 native_selfplay_15.cfg：添加 policySurpriseDataWeight=0.5
 - [x] 6.2 更新 automl_cli.py：添加 nnMaxBatchSize 参数
-- [ ] 6.3 更新 mlevo_cli.py DecisionEngine：适配 FP16 和 batch size 逻辑
+- [x] 6.3 更新 mlevo_cli.py DecisionEngine：适配 FP16 和 batch size 逻辑
 
 ## 7. 集成测试
 
