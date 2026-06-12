@@ -13,10 +13,11 @@ import os
 import json
 import ctypes
 import argparse
-import subprocess
 import time
 import math
 from typing import List, Tuple, Optional
+
+from tools.worker_client import WorkerClient
 
 def sprt_check(wins, losses, alpha=0.05, beta=0.05, elo_diff=35):
     """
@@ -116,85 +117,21 @@ except Exception as e:
     print(f"[Warning] Failed to load opening book: {e}")
     opening_book = None
 
-# Global handle for white worker process
-white_worker_process = None
+# Global handle for white worker client
+white_worker_client: Optional[WorkerClient] = None
 
-def _reload_white_worker_process(white_model_path: str):
-    global white_worker_process
-    if white_worker_process is not None:
-        try:
-            white_worker_process.stdin.write("quit\n")
-            white_worker_process.stdin.flush()
-            white_worker_process.terminate()
-            white_worker_process.wait(timeout=1.0)
-        except Exception:
-            pass
-        white_worker_process = None
-        
+def _start_white_worker(white_model_path: str) -> Optional[WorkerClient]:
+    """Start a WorkerClient for the given white model."""
     if not white_model_path:
-        return
-        
-    print(f"[Worker] Spawning White AI Worker with model: {white_model_path}")
-    worker_script = os.path.join(BASE_DIR, "ai_worker.py")
-    # Ensure subprocess inherits GPU library paths (WSL2 + cuDNN)
-    worker_env = os.environ.copy()
-    wsl_lib = "/usr/lib/wsl/lib"
-    if os.path.isdir(wsl_lib) and "LD_LIBRARY_PATH" not in worker_env.get("LD_LIBRARY_PATH", ""):
-        worker_env["LD_LIBRARY_PATH"] = wsl_lib + ":" + worker_env.get("LD_LIBRARY_PATH", "")
-    cudnn_lib = os.path.join(BASE_DIR, ".venv", "lib", f"python3.{sys.version_info.minor}", "site-packages", "nvidia", "cudnn", "lib")
-    if os.path.isdir(cudnn_lib):
-        worker_env["LD_LIBRARY_PATH"] = cudnn_lib + ":" + worker_env.get("LD_LIBRARY_PATH", "")
-    worker_env["CUDA_VISIBLE_DEVICES"] = "0"
-    try:
-        white_worker_process = subprocess.Popen(
-            [sys.executable, worker_script, white_model_path, KATA_CONFIG_PATH],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=worker_env
-        )
-        ready_line = white_worker_process.stdout.readline()
-        if ready_line:
-            status = json.loads(ready_line.strip())
-            if status.get("status") == "ready":
-                print("[Worker] White AI Worker successfully initialized and ready!")
-            else:
-                print(f"[Worker] Subprocess startup abnormal: {status}")
-    except Exception as e:
-        print(f"[Worker] Failed to start subprocess: {e}")
-        white_worker_process = None
-
-def _query_white_worker_move(history: List[Tuple[int, int, int]], visits: int, policy: float, value: float, engine: str) -> Optional[Tuple[int, int, int]]:
-    global white_worker_process
-    if white_worker_process is None:
         return None
-        
-    req = {
-        "action": "search",
-        "history": [[int(x), int(y), int(r)] for x, y, r in history],
-        "visits": int(visits),
-        "policy": float(policy),
-        "value": float(value),
-        "engine": str(engine),
-        "role": int(WHITE)
-    }
-    
-    try:
-        white_worker_process.stdin.write(json.dumps(req) + "\n")
-        white_worker_process.stdin.flush()
-        
-        resp_line = white_worker_process.stdout.readline()
-        if resp_line:
-            resp = json.loads(resp_line.strip())
-            if resp.get("status") == "ok":
-                return int(resp["x"]), int(resp["y"]), int(resp["score"])
-            else:
-                print(f"[Worker] Search error: {resp.get('error')}")
-    except Exception as e:
-        print(f"[Worker] IPC failed: {e}")
-    return None
+    print(f"[Worker] Spawning White AI Worker with model: {white_model_path}")
+    client = WorkerClient(white_model_path, KATA_CONFIG_PATH, timeout=10.0, max_retries=2)
+    if client.start():
+        print("[Worker] White AI Worker successfully initialized and ready!")
+        return client
+    else:
+        print("[Worker] Failed to start White AI Worker")
+        return None
 
 def is_symmetric(pos1, pos2, center_x=BOARD_SIZE//2, center_y=BOARD_SIZE//2):
     x1, y1 = pos1
@@ -322,7 +259,7 @@ def main():
 
     # Spin up White worker subprocess if custom white model configured
     if args.white_model:
-        _reload_white_worker_process(args.white_model)
+        white_worker_client = _start_white_worker(args.white_model)
 
     results = []
     black_wins = 0
@@ -368,8 +305,14 @@ def main():
 
             # Reload white worker only when model changes
             if current_white_model and current_white_model != last_white_model:
-                _reload_white_worker_process(current_white_model)
+                if white_worker_client is not None:
+                    white_worker_client.close()
+                white_worker_client = _start_white_worker(current_white_model)
                 last_white_model = current_white_model
+
+            # Reset board state for color symmetry (both sides start clean)
+            if white_worker_client is not None:
+                white_worker_client.reset_board()
 
             history = []
             winner = None
@@ -457,14 +400,11 @@ def main():
                         break
                 else:
                     # White AI Move
-                    if args.white_model and white_worker_process is not None:
-                        # Subprocess White Worker
-                        res = _query_white_worker_move(history, args.visits_white, 0.3, 0.3, "MCTS")
-                        if res is None:
-                            # Retry once on transient failure
-                            res = _query_white_worker_move(history, args.visits_white, 0.3, 0.3, "MCTS")
-                        if res is not None:
-                            wx, wy, wscore = res
+                    if args.white_model and white_worker_client is not None:
+                        # WorkerClient White AI
+                        resp = white_worker_client.query(history, args.visits_white, 0.3, 0.3, "MCTS", WHITE)
+                        if resp.get("status") == "ok":
+                            wx, wy, wscore = int(resp["x"]), int(resp["y"]), int(resp["score"])
                             dll.DoMove(env, wx, wy, WHITE)
                             history.append((wx, wy, WHITE))
                             active_history.append((wx, wy, WHITE))
@@ -473,8 +413,32 @@ def main():
                                 winner = WHITE
                             else:
                                 current_role = BLACK
+                        elif resp.get("error") == "WORKER_CRASHED":
+                            # Attempt to restart worker and retry once
+                            print("  [Recovery] Worker crashed, restarting...")
+                            white_worker_client.close()
+                            white_worker_client = _start_white_worker(args.white_model)
+                            if white_worker_client is not None:
+                                white_worker_client.reset_board()
+                                resp2 = white_worker_client.query(history, args.visits_white, 0.3, 0.3, "MCTS", WHITE)
+                                if resp2.get("status") == "ok":
+                                    wx, wy, wscore = int(resp2["x"]), int(resp2["y"]), int(resp2["score"])
+                                    dll.DoMove(env, wx, wy, WHITE)
+                                    history.append((wx, wy, WHITE))
+                                    active_history.append((wx, wy, WHITE))
+                                    print(f"  Step {len(history)}: WHITE (worker) places at {(wx, wy)} (score={wscore}) [recovered]")
+                                    if dll.CheckWin(env, wx, wy, WHITE):
+                                        winner = WHITE
+                                    else:
+                                        current_role = BLACK
+                                else:
+                                    print(f"  [Error] Worker still failing after restart: {resp2.get('error')}")
+                                    break
+                            else:
+                                print("  [Error] Failed to restart worker")
+                                break
                         else:
-                            print("  [Error] White worker subprocess failed to respond!")
+                            print(f"  [Error] White worker error: {resp.get('error')}")
                             break
                     else:
                         # Built-in White AI DLL MCTS search
@@ -542,14 +506,8 @@ def main():
 
     finally:
         # Standard cleanups for sub-processes
-        if white_worker_process is not None:
-            try:
-                white_worker_process.stdin.write("quit\n")
-                white_worker_process.stdin.flush()
-                white_worker_process.terminate()
-                white_worker_process.wait(timeout=1.0)
-            except Exception:
-                pass
+        if white_worker_client is not None:
+            white_worker_client.close()
         dll.ReleaseEngine(env)
 
     # Save summary report

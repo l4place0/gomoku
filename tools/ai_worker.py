@@ -44,6 +44,20 @@ dll.GetTopMoves.restype = ctypes.c_int
 env = dll.GetGameEngine()
 local_history = []
 
+def _reset_board_state():
+    """Reset local board state by undoing all moves."""
+    global local_history
+    for x, y, r in reversed(local_history):
+        dll.UndoMove(env, x, y, r)
+    local_history = []
+
+def _init_vcf():
+    """Initialize VCF solver by doing a dummy move cycle to ensure zob_board is set."""
+    # Play center move and undo to trigger board initialization
+    cx, cy, cr = 7, 7, 0
+    dll.DoMove(env, cx, cy, cr)
+    dll.UndoMove(env, cx, cy, cr)
+
 def main():
     global local_history
     # 从命令行参数读取模型路径与配置路径
@@ -56,7 +70,8 @@ def main():
 
     # SECURITY: Resolve symlinks and reject path traversal attempts
     for p in (model_path, config_path):
-        if ".." in os.path.relpath(p, BASE_DIR).split(os.sep):
+        rel = os.path.relpath(p, PROJECT_ROOT)
+        if ".." in rel.split(os.sep):
             print(json.dumps({"error": f"Path traversal rejected: {p}", "status": "error"}), flush=True)
             sys.exit(1)
     
@@ -68,7 +83,10 @@ def main():
     if not loaded:
         print(json.dumps({"error": f"Failed to load KataModel: {model_path}", "status": "error"}), flush=True)
         sys.exit(1)
-        
+
+    # Initialize VCF solver zob_board after model load
+    _init_vcf()
+
     print(json.dumps({"status": "ready"}), flush=True)
     
     while True:
@@ -84,7 +102,12 @@ def main():
         try:
             req = json.loads(line)
             action = req.get("action")
-            if action == "search":
+            if action == "reset":
+                _reset_board_state()
+                _init_vcf()
+                print(json.dumps({"status": "ok"}), flush=True)
+                continue
+            elif action == "search":
                 received_history = req.get("history", []) # List of [x, y, role]
 
                 # Validate history moves

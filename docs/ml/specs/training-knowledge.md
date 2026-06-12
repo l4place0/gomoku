@@ -186,7 +186,7 @@ The completed 5-round evolution plan on a local GTX 1650 Ti GPU provided critica
 
 ## 🧠 Insights from b10c256nbt-validation (2026-06-11)
 
-The 3-round validation of b10c256nbt (6.49M params) on GTX 1650 Ti (4GB VRAM, 7.7GB RAM WSL2) revealed critical constraints:
+The 3-round validation of b10c256nbt (6.49M params) on GTX 1650 Ti (4GB VRAM, 7.7GB RAM WSL2) revealed critical constraints. **重要: 所有 PK 结果均不可信，详见第 7 点。**
 
 1. **VRAM is NOT the bottleneck**:
    - b10c256nbt training (batch=64): peak VRAM 1.3GB, well within 4GB limit
@@ -218,18 +218,28 @@ The 3-round validation of b10c256nbt (6.49M params) on GTX 1650 Ti (4GB VRAM, 7.
    - Step time: 47-95s (thermal throttling)
    - ~4x slower than b10c128 (16s/step)
 
-7. **PK engineering improvements implemented**:
+7. **PK 评测全部失效（核心问题）**:
+   - **IPC 通信崩溃**: Worker 进程推理时反复崩溃，R1 日志有 357 次 `IPC failed`
+   - **R1 结果 0/0**: ledger 记录 `wins_new=0, losses_new=0`，是崩溃默认值，非真实 0/100
+   - **R2 结果丢失**: PK 实际跑了 100 局（WHITE 赢 90 / BLACK 赢 9 / 平 1），但未写入 ledger
+   - **颜色偏差严重**: R2 中 WHITE（基线）胜率 90%，candidate 几乎全败
+   - **VCF solver 未初始化**: `initVCFSolver::zob_board not init` 错误贯穿所有 PK 日志
+   - **R3 样本不足**: 仅 10 局 + 32 visits，统计意义为零
+   - **结论**: b10c256nbt 的 0% 胜率不可信，真实原因是 PK 脚本崩溃，不是模型能力
+
+8. **PK engineering improvements implemented**:
    - Single-process alternating colors (replaces two sub-rounds)
    - SPRT early termination (stops when result is decisive)
    - Task ID for PK output files (prevents orphan conflicts)
    - Passive metrics collector (StageMetrics in automl_cli.py)
+   - **但这些改进在 b10c256nbt 验证中未完全生效，PK 仍然崩溃**
 
-8. **Recommended parameters for b10c256nbt**:
+9. **Recommended parameters for b10c256nbt**:
    - `tr_batch`: 64 (safe), 128 (possible)
    - `tr_lr`: 0.001 (KataGo community recommendation)
    - `sh_samples`: 50000+ (minimum for effective learning)
    - `sf_games`: 800+ (sufficient data per round)
    - `sf_visits`: 64-96 (throughput vs quality tradeoff)
-   - `pk_games`: 10-30 (RAM safe)
-   - `pk_visits`: 32 (RAM safe)
+   - `pk_games`: 100 (需要修复 PK 脚本后验证)
+   - `pk_visits`: 128/128 对称（消除颜色偏差）
 
