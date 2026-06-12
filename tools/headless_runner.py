@@ -19,36 +19,43 @@ from typing import List, Tuple, Optional
 
 from tools.worker_client import WorkerClient
 
-def sprt_check(wins, losses, alpha=0.05, beta=0.05, elo_diff=35):
-    """
-    Sequential Probability Ratio Test for early termination.
-    Returns: 'candidate_wins', 'baseline_wins', or None (continue).
-    Tests H0: candidate is weaker than baseline by elo_diff vs H1: candidate is stronger.
-    """
-    if wins + losses < 10:
+# SPRT: use ml/sprt.py if available, fall back to local implementation
+try:
+    from ml.sprt import sprt_check as _sprt_check, compute_sprt_result
+    _HAS_SPRT_MODULE = True
+except ImportError:
+    _HAS_SPRT_MODULE = False
+
+    def _sprt_check(wins, losses, alpha=0.05, beta=0.05, elo_diff=35):
+        if wins + losses < 1:
+            return None
+        p1 = 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0))
+        p0 = 0.5
+        llr = 0.0
+        if wins > 0:
+            llr += wins * math.log(p1 / p0)
+        if losses > 0:
+            llr += losses * math.log((1 - p1) / (1 - p0))
+        a = math.log(beta / (1 - alpha))
+        b = math.log((1 - beta) / alpha)
+        if llr >= b:
+            return "candidate_wins"
+        elif llr <= a:
+            return "baseline_wins"
         return None
 
-    # Convert Elo difference to win probability
-    # P(win) = 1 / (1 + 10^(-elo_diff/400))
-    p1 = 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0))  # under H1
-    p0 = 0.5  # under H0 (equal strength)
-
-    # Log-likelihood ratio
-    llr = 0.0
-    for _ in range(wins):
-        llr += math.log(p1 / p0)
-    for _ in range(losses):
-        llr += math.log((1 - p1) / (1 - p0))
-
-    # Decision boundaries
-    a = math.log(beta / (1 - alpha))
-    b = math.log((1 - beta) / alpha)
-
-    if llr >= b:
-        return "candidate_wins"
-    elif llr <= a:
-        return "baseline_wins"
-    return None
+    def compute_sprt_result(wins, losses, alpha=0.05, beta=0.05, elo_diff=35.0):
+        total = wins + losses
+        winrate = wins / total if total > 0 else 0.5
+        decision_raw = _sprt_check(wins, losses, alpha, beta, elo_diff)
+        decision = "accept" if decision_raw == "candidate_wins" else "reject" if decision_raw == "baseline_wins" else "undecided"
+        return type("SPRTResult", (), {
+            "decision": decision, "llr": 0.0, "elo_diff": 0.0,
+            "ci_lower": 0.0, "ci_upper": 0.0, "winrate": winrate,
+            "wins": wins, "losses": losses, "total": total,
+            "to_dict": lambda self: {"decision": self.decision, "winrate": self.winrate,
+                                     "wins": self.wins, "losses": self.losses, "total": self.total}
+        })()
 
 # Constants
 BOARD_SIZE = 15
@@ -244,6 +251,30 @@ def parse_args():
         default=False,
         help="Enable SPRT early termination when result is statistically significant."
     )
+    parser.add_argument(
+        "--min-games",
+        type=int,
+        default=20,
+        help="Minimum number of games before SPRT early stop can trigger (default: 20)."
+    )
+    parser.add_argument(
+        "--sprt-h1",
+        type=float,
+        default=35.0,
+        help="SPRT H1 hypothesis: Elo difference to detect (default: 35)."
+    )
+    parser.add_argument(
+        "--sprt-alpha",
+        type=float,
+        default=0.05,
+        help="SPRT Type I error rate (default: 0.05)."
+    )
+    parser.add_argument(
+        "--sprt-beta",
+        type=float,
+        default=0.05,
+        help="SPRT Type II error rate (default: 0.05)."
+    )
     return parser.parse_args()
 
 def main():
@@ -255,6 +286,9 @@ def main():
     print(f"Games: {args.games}")
     print(f"Output Report: {args.output}")
     print(f"Early Stop: {args.early_stop}")
+    if args.early_stop:
+        print(f"  SPRT H1: {args.sprt_h1} Elo, Alpha: {args.sprt_alpha}, Beta: {args.sprt_beta}")
+        print(f"  Min Games: {args.min_games}")
     print("=" * 60)
 
     # Spin up White worker subprocess if custom white model configured
@@ -265,6 +299,7 @@ def main():
     black_wins = 0
     white_wins = 0
     active_history = []  # Precise singleton undo tracker
+    sprt_result_data = None  # SPRT result if early stop triggered
 
     # Color-balanced tracking: candidate = black_model (model A)
     candidate_black_wins = 0   # candidate wins when playing black
@@ -493,15 +528,24 @@ def main():
             })
 
             # Early termination check
-            if args.early_stop and game_idx >= 9:  # Need at least 10 games
-                # black_wins and white_wins track the candidate's wins by color
+            if args.early_stop and game_idx >= args.min_games - 1:
                 candidate_total = candidate_black_wins + candidate_white_wins
                 baseline_total = baseline_black_wins + baseline_white_wins
-                decision = sprt_check(candidate_total, baseline_total)
+                decision = _sprt_check(candidate_total, baseline_total,
+                                       alpha=args.sprt_alpha, beta=args.sprt_beta,
+                                       elo_diff=args.sprt_h1)
                 if decision is not None:
+                    sprt_result = compute_sprt_result(candidate_total, baseline_total,
+                                                      alpha=args.sprt_alpha, beta=args.sprt_beta,
+                                                      elo_diff=args.sprt_h1)
+                    sprt_result_data = sprt_result.to_dict() if hasattr(sprt_result, 'to_dict') else {
+                        "decision": sprt_result.decision, "winrate": sprt_result.winrate,
+                        "wins": sprt_result.wins, "losses": sprt_result.losses, "total": sprt_result.total
+                    }
                     print(f"\n[SPRT] Early termination after {game_idx + 1} games! Decision: {decision}")
                     print(f"  Candidate wins: {candidate_total} (as black: {candidate_black_wins}, as white: {candidate_white_wins})")
                     print(f"  Baseline wins:  {baseline_total} (as black: {baseline_black_wins}, as white: {baseline_white_wins})")
+                    print(f"  Elo diff: {sprt_result.elo_diff:.1f} [{sprt_result.ci_lower:.1f}, {sprt_result.ci_upper:.1f}]")
                     break
 
     finally:
@@ -530,6 +574,20 @@ def main():
         },
         "games": results
     }
+
+    # Add SPRT result if early stop was triggered
+    if sprt_result_data is not None:
+        report["sprt_result"] = sprt_result_data
+
+    # Also compute final SPRT result if early stop was enabled but didn't trigger
+    if args.early_stop and sprt_result_data is None and candidate_total + baseline_total > 0:
+        final_sprt = compute_sprt_result(candidate_total, baseline_total,
+                                         alpha=args.sprt_alpha, beta=args.sprt_beta,
+                                         elo_diff=args.sprt_h1)
+        report["sprt_result"] = final_sprt.to_dict() if hasattr(final_sprt, 'to_dict') else {
+            "decision": final_sprt.decision, "winrate": final_sprt.winrate,
+            "wins": final_sprt.wins, "losses": final_sprt.losses, "total": final_sprt.total
+        }
 
     try:
         with open(args.output, "w", encoding="utf-8") as f:

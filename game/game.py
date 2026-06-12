@@ -16,6 +16,7 @@ from typing import List, Optional, Tuple
 from ml.verify_symmetry import SymmetryHelper
 from ml.verify_opening_book import OpeningBook
 from game.game_logger import GameLogger
+from tools.worker_client import WorkerClient
 
 # -------------------------------------------------------------------
 # DLL 接口封装
@@ -283,7 +284,7 @@ virtual_candidates = []
 winner = None
 ai_is_searching = False
 last_ai_move_ticks = 0
-white_worker_process = None
+white_worker_client = None  # WorkerClient instance for dual-model play
 search_log_panel_open = True
 search_log_all_calls = False
 search_log_entries = []
@@ -2001,8 +2002,8 @@ def handle_normal(gs: GameState, btn: pygame.Rect, sidebar_buttons: dict):
         is_white_worker_active = (gs.current_role == WHITE and gs.white_model_path)
         
         if is_white_worker_active:
-            global white_worker_process
-            if white_worker_process is None:
+            global white_worker_client
+            if white_worker_client is None:
                 _reload_white_worker_process(gs)
             
             ai_is_searching = True
@@ -2131,6 +2132,9 @@ def handle_game_over(gs: GameState):
                 gs.current_role = BLACK
                 gs.human_is_black = True
                 gs.game_id = None
+                # 重置白方 Worker 板状态
+                if white_worker_client is not None:
+                    white_worker_client.reset_board()
                 undo_stack.clear()
                 global virtual_candidates
                 virtual_candidates = []
@@ -2142,85 +2146,46 @@ def handle_game_over(gs: GameState):
 # 子进程 Worker 通信与生命周期函数
 # -------------------------------------------------------------------
 def _reload_white_worker_process(gs: GameState):
-    global white_worker_process
-    if white_worker_process is not None:
-        try:
-            white_worker_process.stdin.write("quit\n")
-            white_worker_process.stdin.flush()
-            white_worker_process.terminate()
-            white_worker_process.wait(timeout=1.0)
-        except Exception:
-            pass
-        white_worker_process = None
-        
+    global white_worker_client
+    if white_worker_client is not None:
+        white_worker_client.close()
+        white_worker_client = None
+
     if not gs.white_model_path:
         return
-        
-    print(f"[Worker] 启动白方独立子进程，载入模型: {gs.white_model_path}")
-    worker_script = os.path.join(PROJECT_ROOT, "tools", "ai_worker.py")
-    try:
-        # 使用 sys.executable 保持 Python 环境一致
-        white_worker_process = subprocess.Popen(
-            [sys.executable, worker_script, gs.white_model_path, KATA_CONFIG_PATH],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
-        
-        # 等待 ready 信号
-        ready_line = white_worker_process.stdout.readline()
-        if ready_line:
-            status = json.loads(ready_line.strip())
-            if status.get("status") == "ready":
-                print("[Worker] 白方 AI 子进程启动成功且已就绪！")
-            else:
-                print(f"[Worker] 子进程启动异常: {status}")
-    except Exception as e:
-        print(f"[Worker] 启动子进程失败: {e}")
-        white_worker_process = None
+
+    print(f"[Worker] 启动白方 WorkerClient，载入模型: {gs.white_model_path}")
+    white_worker_client = WorkerClient(gs.white_model_path, KATA_CONFIG_PATH, timeout=10.0, max_retries=2)
+    if white_worker_client.start():
+        print("[Worker] 白方 AI WorkerClient 启动成功！")
+    else:
+        print("[Worker] 白方 AI WorkerClient 启动失败")
+        white_worker_client = None
 
 def _query_white_worker_move(gs: GameState, visits, policy, value, engine) -> Optional[AIMove]:
-    global white_worker_process
-    if white_worker_process is None:
+    global white_worker_client
+    if white_worker_client is None:
         return None
-        
-    # 构建当前棋盘的落子历史序列传输给子进程
-    # 注意: 把 GameState 序列里的 (x, y, role) 转换为子进程需要的格式
-    history_list = []
-    for x, y, r in gs.history:
-        history_list.append([int(x), int(y), int(r)])
-        
-    req = {
-        "action": "search",
-        "history": history_list,
-        "visits": int(visits),
-        "policy": float(policy),
-        "value": float(value),
-        "engine": str(engine),
-        "role": int(WHITE)
-    }
-    
-    try:
-        white_worker_process.stdin.write(json.dumps(req) + "\n")
-        white_worker_process.stdin.flush()
-        
-        resp_line = white_worker_process.stdout.readline()
-        if resp_line:
-            resp = json.loads(resp_line.strip())
-            if resp.get("status") == "ok":
-                # 返回一个模拟的 AIMove 结构
-                res = AIMove()
-                res.x = int(resp["x"])
-                res.y = int(resp["y"])
-                res.score = int(resp["score"])
-                return res
-            else:
-                print(f"[Worker] 搜索出错: {resp.get('error')}")
-    except Exception as e:
-        print(f"[Worker] 通信发送/接收着法异常: {e}")
+
+    # 构建当前棋盘的落子历史序列
+    history_list = [(int(x), int(y), int(r)) for x, y, r in gs.history]
+
+    resp = white_worker_client.query(history_list, visits=int(visits),
+                                     policy=float(policy), value=float(value),
+                                     engine=str(engine), role=int(WHITE))
+
+    if resp.get("status") == "ok":
+        res = AIMove()
+        res.x = int(resp["x"])
+        res.y = int(resp["y"])
+        res.score = int(resp["score"])
+        return res
+    elif resp.get("error") == "WORKER_CRASHED":
+        print("[Worker] 白方 Worker 崩溃，尝试重启...")
         _reload_white_worker_process(gs)
+    else:
+        print(f"[Worker] 搜索出错: {resp.get('error')}")
+    return None
     return None
 
 def dispatch(gs: GameState, btn: pygame.Rect, sidebar_buttons: dict):
@@ -2275,15 +2240,9 @@ finally:
     else:
         game_logger.session_end(0)
         
-    # 清理外部子进程进程树
-    if white_worker_process is not None:
-        try:
-            white_worker_process.stdin.write("quit\n")
-            white_worker_process.stdin.flush()
-            white_worker_process.terminate()
-            white_worker_process.wait(timeout=1.0)
-        except Exception:
-            pass
+    # 清理外部子进程
+    if white_worker_client is not None:
+        white_worker_client.close()
             
     pygame.quit()
     dll.ReleaseEngine(env)

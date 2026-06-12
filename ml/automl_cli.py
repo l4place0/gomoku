@@ -170,6 +170,11 @@ def create_parser():
     parser.add_argument("--pk-visits-b", type=int, default=128, help="MCTS visits for Black AI")
     parser.add_argument("--pk-visits-w", type=int, default=64, help="MCTS visits for White AI")
     parser.add_argument("--pk-threshold", type=float, default=0.55, help="Winrate threshold for model promotion")
+    # SPRT parameters
+    parser.add_argument("--pk-sprt-h1", type=float, default=35.0, help="SPRT H1 hypothesis: Elo difference to detect")
+    parser.add_argument("--pk-sprt-alpha", type=float, default=0.05, help="SPRT Type I error rate")
+    parser.add_argument("--pk-sprt-beta", type=float, default=0.05, help="SPRT Type II error rate")
+    parser.add_argument("--pk-min-games", type=int, default=20, help="Minimum games before SPRT early stop")
     
     return parser
 
@@ -226,11 +231,29 @@ def format_evidence_chain(args):
         f"  --pk-visits-b        : {args.pk_visits_b}",
         f"  --pk-visits-w        : {args.pk_visits_w}",
         f"  --pk-threshold       : {args.pk_threshold}",
+        f"  --pk-sprt-h1         : {args.pk_sprt_h1}",
+        f"  --pk-sprt-alpha      : {args.pk_sprt_alpha}",
+        f"  --pk-sprt-beta       : {args.pk_sprt_beta}",
+        f"  --pk-min-games       : {args.pk_min_games}",
         "================================================================================"
     ]
     return "\n".join(lines)
 
-def evaluate_promotion(winrate, threshold):
+def evaluate_promotion(winrate, threshold, sprt_decision=None):
+    """Evaluate model promotion. Uses SPRT decision if available, falls back to threshold.
+
+    Args:
+        winrate: Candidate win rate.
+        threshold: Promotion threshold (used when no SPRT decision).
+        sprt_decision: SPRT decision string ("accept", "reject", or None).
+
+    Returns:
+        True if model should be promoted.
+    """
+    if sprt_decision == "accept":
+        return True
+    if sprt_decision == "reject":
+        return False
     return winrate >= threshold
 
 class BackgroundService:
@@ -767,6 +790,7 @@ def run_pk(args, data_dir: Path, logs_dir: Path, round_no: int, candidate_gz_pat
     """Execute PK evaluation stage."""
     start_time = time.time()
     save_progress("pk", 0)
+    sprt_result = None  # Will be set if SPRT data is available
     print(f"\n[Round {round_no}] [5/5] [PK] Initiating Headless Arena model evaluation...", flush=True)
     pk_metrics = StageMetrics(round_no, "pk") if _HAS_METRICS else None
     if pk_metrics:
@@ -807,7 +831,11 @@ def run_pk(args, data_dir: Path, logs_dir: Path, round_no: int, candidate_gz_pat
                 "--visits-black", str(args.pk_visits_b),
                 "--visits-white", str(args.pk_visits_w),
                 "--output", str(pk_out),
-                "--early-stop"
+                "--early-stop",
+                "--min-games", str(args.pk_min_games),
+                "--sprt-h1", str(args.pk_sprt_h1),
+                "--sprt-alpha", str(args.pk_sprt_alpha),
+                "--sprt-beta", str(args.pk_sprt_beta),
             ]
             ok = run_subprocess_redirected(cmd, pk_log)
 
@@ -827,6 +855,10 @@ def run_pk(args, data_dir: Path, logs_dir: Path, round_no: int, candidate_gz_pat
                         losses_new = r["summary"]["baseline_wins"]
                         total_pk = wins_new + losses_new
                         winrate = wins_new / total_pk if total_pk > 0 else 0.0
+                        # Extract SPRT result if present
+                        sprt_result = r.get("sprt_result")
+                        if sprt_result:
+                            print(f"  [PK] SPRT: decision={sprt_result.get('decision')}, elo_diff={sprt_result.get('elo_diff', 'N/A')}, CI=[{sprt_result.get('ci_lower', 'N/A')}, {sprt_result.get('ci_upper', 'N/A')}]", flush=True)
                         print(f"  [PK] Result: candidate={wins_new} baseline={losses_new} total={total_pk}", flush=True)
                         print(f"  [PK] Color split: cand_black={r['summary'].get('candidate_black_wins',0)} cand_white={r['summary'].get('candidate_white_wins',0)}", flush=True)
                 else:
@@ -855,6 +887,7 @@ def run_pk(args, data_dir: Path, logs_dir: Path, round_no: int, candidate_gz_pat
     result._pk_winrate = winrate
     result._pk_wins = wins_new
     result._pk_losses = losses_new
+    result._sprt_result = sprt_result
     return result
 
 
@@ -1002,11 +1035,16 @@ def main():
     winrate = getattr(pk_result, '_pk_winrate', 0.5) if pk_result else 0.5
     wins_new = getattr(pk_result, '_pk_wins', 0) if pk_result else 0
     losses_new = getattr(pk_result, '_pk_losses', 0) if pk_result else 0
-    
+    sprt_result = getattr(pk_result, '_sprt_result', None) if pk_result else None
+    sprt_decision = sprt_result.get('decision') if sprt_result else None
+
     # ------------------ DECISION: PROMOTION ------------------
-    promoted = evaluate_promotion(winrate, args.pk_threshold)
+    promoted = evaluate_promotion(winrate, args.pk_threshold, sprt_decision)
     if promoted:
-        print(f"\n[Round {round_no}] [RESULT] SUCCESS! Winrate {winrate:.2%} >= {args.pk_threshold:.2%}.", flush=True)
+        if sprt_decision == "accept":
+            print(f"\n[Round {round_no}] [RESULT] SUCCESS (SPRT)! Winrate {winrate:.2%}, Elo diff={sprt_result.get('elo_diff', 'N/A')}.", flush=True)
+        else:
+            print(f"\n[Round {round_no}] [RESULT] SUCCESS! Winrate {winrate:.2%} >= {args.pk_threshold:.2%}.", flush=True)
         print(f"[Round {round_no}] [RESULT] Promoting new model to best model...", flush=True)
         
         # Overwrite KataGomo active model
@@ -1033,7 +1071,10 @@ def main():
         except Exception as e:
             print(f"[Warning] Opening book mining failed: {e}", file=sys.stderr)
     else:
-        print(f"\n[Round {round_no}] [RESULT] DISCARDED. Winrate {winrate:.2%} < {args.pk_threshold:.2%}. Retaining old model.", flush=True)
+        if sprt_decision == "reject":
+            print(f"\n[Round {round_no}] [RESULT] DISCARDED (SPRT). Winrate {winrate:.2%}, Elo diff={sprt_result.get('elo_diff', 'N/A')}. Retaining old model.", flush=True)
+        else:
+            print(f"\n[Round {round_no}] [RESULT] DISCARDED. Winrate {winrate:.2%} < {args.pk_threshold:.2%}. Retaining old model.", flush=True)
         
     # ------------------ ARCHIVE EVIDENCE LEDGER ------------------
     ledger_path = logs_dir / "evolution_ledger.json"
@@ -1048,18 +1089,22 @@ def main():
         except Exception:
             pass
             
+    pk_entry = {
+        "games": args.pk_games,
+        "wins_new": wins_new,
+        "losses_new": losses_new,
+        "winrate": winrate,
+        "threshold": args.pk_threshold,
+        "promoted": promoted
+    }
+    if sprt_result:
+        pk_entry["sprt"] = sprt_result
+
     ledger.append({
         "round": round_no,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "params": vars(args),
-        "pk": {
-            "games": args.pk_games,
-            "wins_new": wins_new,
-            "losses_new": losses_new,
-            "winrate": winrate,
-            "threshold": args.pk_threshold,
-            "promoted": promoted
-        }
+        "pk": pk_entry
     })
     
     ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")

@@ -33,6 +33,7 @@ class ModelRecord:
     hypothesis: str = ""
     timestamp: str = ""  # ISO 8601
     file: str = ""  # relative path to model file
+    sprt_result: Optional[dict] = None  # SPRT evaluation result
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -40,6 +41,9 @@ class ModelRecord:
     @classmethod
     def from_json(cls, line: str) -> "ModelRecord":
         data = json.loads(line)
+        # Handle missing fields for backward compatibility
+        if "sprt_result" not in data:
+            data["sprt_result"] = None
         return cls(**data)
 
 
@@ -148,6 +152,22 @@ class ModelRegistry:
         if not promoted:
             return None
         return promoted[-1]
+
+    def get_lr_history(self, branch: str, last_n: int = 10) -> list[dict]:
+        """Get lr history for a branch.
+
+        Returns list of dicts with round, tr_lr, promoted fields.
+        """
+        records = self.find_by_branch(branch)[-last_n:]
+        return [
+            {
+                "round": r.round,
+                "tr_lr": r.params.get("tr_lr"),
+                "promoted": r.promoted,
+                "winrate": r.winrate,
+            }
+            for r in records
+        ]
 
     def filter_models(
         self,

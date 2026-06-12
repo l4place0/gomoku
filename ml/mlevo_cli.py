@@ -145,19 +145,65 @@ def _get_dag():
 
 # --- Decision Engine (preserved from original) ---
 
+# Recommended default strategy for DecisionEngine
+DEFAULT_STRATEGY = {
+    # Entropy boost on failure
+    "entropy_boost_games_mult": 1.2,      # sf_games multiplier on failure
+    "entropy_boost_visits_add": 16,       # sf_visits addition on failure
+    # LR plateau detection
+    "plateau_loss_threshold": 0.05,       # loss diff below this = plateau
+    "plateau_lr_decay": 0.5,              # lr multiplier on plateau
+    # LR decay on consecutive failures
+    "failure_decay_threshold": 2,         # consecutive failures to trigger decay
+    "failure_lr_decay": 0.7,              # lr multiplier on consecutive failures
+    # LR floor
+    "lr_floor": 0.0001,                   # minimum lr
+    # OOM recovery
+    "oom_batch_min": 16,                  # minimum batch size
+    "oom_batch_decay": 0.5,               # batch multiplier on OOM
+    # NaN recovery
+    "nan_lr_decay": 0.5,                  # lr multiplier on NaN
+    # Validation thresholds (for warnings)
+    "min_sf_games_warn": 100,
+    "min_pk_games_warn": 20,
+}
+
+
 class DecisionEngine:
-    def __init__(self, baseline_config, history, log_contents=None):
+    def __init__(self, baseline_config, history, log_contents=None, strategy=None):
         self.baseline = baseline_config
         self.history = history
         self.log_contents = log_contents or {}
+        self.strategy = {**DEFAULT_STRATEGY, **(strategy or {})}
+
+    def _get_last_lr(self, round_no):
+        """Get the actual lr used in the specified round from history."""
+        for record in reversed(self.history):
+            if record.get("round") == round_no:
+                return record.get("params", {}).get("tr_lr")
+        return None
+
+    def _count_consecutive_failures(self, from_round):
+        """Count consecutive failures starting from from_round going backwards."""
+        count = 0
+        for record in reversed(self.history):
+            if record.get("round") <= from_round:
+                pk_info = record.get("pk", {})
+                if not pk_info.get("promoted", False):
+                    count += 1
+                else:
+                    break
+        return count
 
     def decide(self, next_round):
+        s = self.strategy
         decided = self.baseline.copy()
         reasons = []
         warnings = []
 
         prev_round = next_round - 1
         prev_round_failed = False
+        prev_round_promoted = False
         prev_round_record = None
 
         if self.history:
@@ -168,12 +214,13 @@ class DecisionEngine:
 
         if prev_round_record:
             pk_info = prev_round_record.get("pk", {})
-            if not pk_info.get("promoted", False):
+            prev_round_promoted = pk_info.get("promoted", False)
+            if not prev_round_promoted:
                 prev_round_failed = True
 
         if prev_round_failed:
-            decided["sf_games"] = int(round(self.baseline.get("sf_games", 500) * 1.2))
-            decided["sf_visits"] = self.baseline.get("sf_visits", 96) + 16
+            decided["sf_games"] = int(round(self.baseline.get("sf_games", 500) * s["entropy_boost_games_mult"]))
+            decided["sf_visits"] = self.baseline.get("sf_visits", 96) + s["entropy_boost_visits_add"]
             reasons.append(f"Entropy boost: sf_games={decided['sf_games']}, sf_visits={decided['sf_visits']}")
         else:
             reasons.append("Entropy boost not triggered")
@@ -187,32 +234,49 @@ class DecisionEngine:
                 except Exception:
                     pass
 
+        # --- LR scheduling with memory ---
+        # Start from the previous round's actual lr, not the baseline
+        last_lr = self._get_last_lr(prev_round)
+        base_lr = last_lr if last_lr is not None else self.baseline.get("tr_lr", 0.002)
+
         lr_decay_triggered = False
         if log_text:
             losses = [float(x) for x in re.findall(r"loss\s*=\s*(\d+\.\d+)", log_text)]
             if len(losses) >= 2:
                 diff = abs(losses[-1] - losses[0])
-                if diff < 0.05:
-                    decided["tr_lr"] = max(0.0001, self.baseline.get("tr_lr", 0.002) * 0.5)
+                if diff < s["plateau_loss_threshold"]:
+                    decided["tr_lr"] = max(s["lr_floor"], base_lr * s["plateau_lr_decay"])
                     lr_decay_triggered = True
                     reasons.append(f"LR decay: tr_lr={decided['tr_lr']} (plateau detected)")
 
         if not lr_decay_triggered:
-            reasons.append("LR decay not triggered")
+            if prev_round_promoted:
+                # Lock lr on success — don't go back up
+                decided["tr_lr"] = base_lr
+                reasons.append(f"LR locked: tr_lr={decided['tr_lr']} (previous round promoted)")
+            else:
+                # On consecutive failures, decay lr
+                consecutive_failures = self._count_consecutive_failures(prev_round)
+                if consecutive_failures >= s["failure_decay_threshold"]:
+                    decided["tr_lr"] = max(s["lr_floor"], base_lr * s["failure_lr_decay"])
+                    reasons.append(f"LR decay: tr_lr={decided['tr_lr']} ({consecutive_failures} consecutive failures)")
+                else:
+                    decided["tr_lr"] = base_lr
+                    reasons.append("LR decay not triggered")
 
         if log_text:
             if "OutOfMemoryError" in log_text or "CUDA out of memory" in log_text:
-                decided["tr_batch"] = max(16, self.baseline.get("tr_batch", 64) // 2)
+                decided["tr_batch"] = max(s["oom_batch_min"], int(self.baseline.get("tr_batch", 64) * s["oom_batch_decay"]))
                 reasons.append(f"OOM recovery: tr_batch={decided['tr_batch']}")
             if "nan" in log_text.lower():
-                decided["tr_lr"] = max(0.0001, self.baseline.get("tr_lr", 0.002) * 0.5)
+                decided["tr_lr"] = max(s["lr_floor"], decided.get("tr_lr", 0.002) * s["nan_lr_decay"])
                 reasons.append(f"NaN recovery: tr_lr={decided['tr_lr']}")
                 warnings.append("Previous round had NaN loss — checkpoint was purged, will reinitialize from scratch")
 
-        if decided.get("sf_games", 0) < 100:
-            warnings.append(f"sf_games ({decided['sf_games']}) below recommended 100")
-        if decided.get("pk_games", 0) < 20:
-            warnings.append(f"pk_games ({decided['pk_games']}) below recommended 20")
+        if decided.get("sf_games", 0) < s["min_sf_games_warn"]:
+            warnings.append(f"sf_games ({decided['sf_games']}) below recommended {s['min_sf_games_warn']}")
+        if decided.get("pk_games", 0) < s["min_pk_games_warn"]:
+            warnings.append(f"pk_games ({decided['pk_games']}) below recommended {s['min_pk_games_warn']}")
 
         return decided, reasons, warnings
 
@@ -375,7 +439,15 @@ def cmd_run(args):
         if not stage_config:
             stages = plan_config.get("stages", [])
             stage_config = stages[0].get("config", {}) if stages else {}
-        engine = DecisionEngine(stage_config, history)
+        # Merge plan strategy with CLI override
+        strategy = plan_config.get("strategy", {})
+        cli_strategy = getattr(args, 'strategy', None)
+        if cli_strategy:
+            try:
+                strategy = {**strategy, **json.loads(cli_strategy)}
+            except json.JSONDecodeError:
+                _error(f"Invalid --strategy JSON: {cli_strategy}")
+        engine = DecisionEngine(stage_config, history, strategy=strategy)
         decided_params, _, _ = engine.decide(round_no)
         decided_params["round"] = round_no
         decided_params["model_name"] = plan_config.get("model_kind", "b10c128")
@@ -630,6 +702,15 @@ def cmd_history(args):
     _output({"model": args.model, "lineage": history}, True)
 
 
+def cmd_lr_history(args):
+    """Get lr history for a branch."""
+    registry = _get_registry()
+    branch = getattr(args, 'branch', 'mainline')
+    last_n = getattr(args, 'last', 10)
+    lr_data = registry.get_lr_history(branch, last_n)
+    _output({"branch": branch, "lr_history": lr_data}, True)
+
+
 def cmd_recover(args):
     """Recover from crashed state."""
     state = load_state()
@@ -758,6 +839,28 @@ def cmd_test(args):
     _output(results, True)
 
 
+def cmd_show_strategy(args):
+    """Show default DecisionEngine strategy with descriptions."""
+    _output({
+        "default_strategy": DEFAULT_STRATEGY,
+        "descriptions": {
+            "entropy_boost_games_mult": "sf_games multiplier on failure (e.g. 1.2 = +20% games)",
+            "entropy_boost_visits_add": "sf_visits addition on failure",
+            "plateau_loss_threshold": "loss diff below this = plateau detected",
+            "plateau_lr_decay": "lr multiplier when plateau detected",
+            "failure_decay_threshold": "consecutive failures to trigger lr decay",
+            "failure_lr_decay": "lr multiplier on consecutive failures",
+            "lr_floor": "minimum lr (never decays below this)",
+            "oom_batch_min": "minimum batch size after OOM",
+            "oom_batch_decay": "batch multiplier on OOM recovery",
+            "nan_lr_decay": "lr multiplier on NaN loss",
+            "min_sf_games_warn": "warn if sf_games below this",
+            "min_pk_games_warn": "warn if pk_games below this",
+        },
+        "usage": "Pass --strategy '{\"failure_lr_decay\": 0.8}' to mlevo run, or add \"strategy\": {...} to training_plan.json"
+    }, True)
+
+
 def cmd_decide(args):
     """Compute next round parameters."""
     plan_name, plan_dir = find_plan(getattr(args, 'plan', None))
@@ -785,7 +888,8 @@ def cmd_decide(args):
         stage_config = stages[0].get("config", {}) if stages else {}
 
     history = load_ledger()
-    engine = DecisionEngine(stage_config, history)
+    strategy = plan_config.get("strategy", {})
+    engine = DecisionEngine(stage_config, history, strategy=strategy)
     decided_params, reasons, warnings = engine.decide(next_round)
     decided_params["round"] = next_round
     decided_params["model_name"] = plan_config.get("model_kind", "b10c128")
@@ -1182,6 +1286,7 @@ def main():
     run_p.add_argument("--change", type=str, default="")
     run_p.add_argument("--branch", type=str, default="mainline")
     run_p.add_argument("--inject", type=str, choices=["oom", "nan", "crash"])
+    run_p.add_argument("--strategy", type=str, default=None, help="JSON string of strategy overrides (see 'mlevo show-strategy')")
 
     # branch
     branch_p = subparsers.add_parser("branch", help="Create a branch")
@@ -1216,6 +1321,14 @@ def main():
     # history
     history_p = subparsers.add_parser("history", help="Model ancestry")
     history_p.add_argument("--model", type=str, required=True)
+
+    # lr-history
+    lr_history_p = subparsers.add_parser("lr-history", help="Learning rate history for a branch")
+    lr_history_p.add_argument("--branch", type=str, default="mainline")
+    lr_history_p.add_argument("--last", type=int, default=10)
+
+    # show-strategy
+    subparsers.add_parser("show-strategy", help="Show default DecisionEngine strategy")
 
     # recover
     subparsers.add_parser("recover", help="Recover from crash")
@@ -1274,6 +1387,8 @@ def main():
         "models": cmd_models,
         "model": cmd_model,
         "history": cmd_history,
+        "lr-history": cmd_lr_history,
+        "show-strategy": cmd_show_strategy,
         "recover": cmd_recover,
         "migrate": cmd_migrate,
         "test": cmd_test,
