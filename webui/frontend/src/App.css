@@ -318,6 +318,11 @@ select:focus, input[type="text"]:focus {
   background: rgba(245, 158, 11, 0.08);
   border-left-color: var(--yellow);
 }
+.log-line.success {
+  color: #a7f3d0;
+  background: rgba(16, 185, 129, 0.08);
+  border-left-color: var(--green);
+}
 
 /* ==========================================================================
    Loading Skeleton Shimmer

@@ -23,6 +23,70 @@ function LogsSkeleton() {
   );
 }
 
+// Single Log Line Component with Syntax Highlighting & Line Numbers
+function LogLine({ text, index, theme }) {
+  const isError = text.toUpperCase().includes('ERROR') || text.toUpperCase().includes('FAIL') || text.toUpperCase().includes('CRASHED');
+  const isWarn = text.toUpperCase().includes('WARN') || text.toUpperCase().includes('WARNING');
+  const isSuccess = text.toUpperCase().includes('SUCCESS') || text.toUpperCase().includes('PASS') || text.toUpperCase().includes('PROMOTED');
+  
+  let cls = 'log-line';
+  if (isError) cls += ' error';
+  else if (isWarn) cls += ' warn';
+  else if (isSuccess) cls += ' success';
+
+  // Highlight tags like [Selfplay], [Train], [PK], [Regression], [Golden] in console logs
+  const parseLineContent = (rawText) => {
+    const regex = /(\[[A-Za-z0-9\-\s_]+\])/g;
+    const parts = rawText.split(regex);
+    return parts.map((part, idx) => {
+      if (regex.test(part)) {
+        const tagName = part.slice(1, -1).toLowerCase();
+        let tagColor = '#8b5cf6'; // Default purple
+        
+        // Dynamic colors for different stages/tags
+        if (tagName.includes('selfplay')) tagColor = '#3b82f6'; // blue
+        else if (tagName.includes('train')) tagColor = '#f59e0b'; // orange/yellow
+        else if (tagName.includes('pk') || tagName.includes('stage-pk')) tagColor = '#10b981'; // green
+        else if (tagName.includes('regression')) tagColor = '#f43f5e'; // pink/rose
+        else if (tagName.includes('golden')) tagColor = '#eab308'; // gold
+        
+        return (
+          <span key={idx} style={{ color: tagColor, fontWeight: 700, marginRight: 2 }}>
+            {part}
+          </span>
+        );
+      }
+      return part;
+    });
+  };
+
+  const getLineNoColor = () => {
+    if (theme === 'matrix') return '#1f8b1f';
+    if (theme === 'light') return '#94a3b8';
+    return 'var(--text-muted)';
+  };
+
+  return (
+    <div className={cls} style={{ display: 'flex', gap: 14, padding: '3px 8px' }}>
+      <span style={{ 
+        color: getLineNoColor(), 
+        width: 36, 
+        textAlign: 'right', 
+        userSelect: 'none', 
+        display: 'inline-block', 
+        flexShrink: 0,
+        fontFamily: 'monospace',
+        opacity: 0.8
+      }}>
+        {index + 1}
+      </span>
+      <span style={{ flex: 1, whiteSpace: 'pre-wrap', wordBreak: 'break-all' }}>
+        {parseLineContent(text)}
+      </span>
+    </div>
+  );
+}
+
 export default function Logs() {
   const [logs, setLogs] = useState([]);
   const [selectedFile, setSelectedFile] = useState('');
@@ -34,10 +98,10 @@ export default function Logs() {
   const [searchQuery, setSearchQuery] = useState('');
   const [fontSize, setFontSize] = useState(12);
   const [copying, setCopying] = useState(false);
+  const [theme, setTheme] = useState('default');
   const logRef = useRef(null);
 
   // Fetch log files
-  // 从后端 API 拉取最新的日志数据
   const refresh = () => {
     setLoading(true);
     const params = round ? { round } : {};
@@ -45,8 +109,6 @@ export default function Logs() {
       const entries = d.logs || d.entries || [];
       setLogs(entries);
       
-      // Auto-select first log file if none selected or the previous selected one is gone
-      // 如果未选中日志，或者之前选中的日志不存在了，默认选中首个日志文件
       if (entries.length > 0 && typeof entries[0] === 'object') {
         const fileNames = entries.map(f => f.file);
         if (!fileNames.includes(selectedFile)) {
@@ -60,29 +122,23 @@ export default function Logs() {
 
   useEffect(() => { 
     refresh(); 
-  }, [round]); // Re-fetch only when round filter changes
+  }, [round]);
 
-  // Auto-scroll to bottom of logs if enabled
-  // 如果开启了自动滚动，每次日志内容更新时滚动到最底部
   useEffect(() => {
     if (autoScroll && logRef.current) {
       logRef.current.scrollTop = logRef.current.scrollHeight;
     }
   }, [logs, selectedFile, level, autoScroll, loading, searchQuery]);
 
-  // Check if response contains structured file items
-  // 判断拉取到的日志数据是否为结构化的文件对象格式
   const isStructured = logs.length > 0 && typeof logs[0] === 'object' && logs[0].file !== undefined;
   const filesList = isStructured ? logs.map(f => f.file) : [];
 
-  // Parse lines to display based on selected file, level, and search filters
-  // 结合当前选择的日志文件、级别过滤及搜索关键词，计算实际要展示的日志行列表
   const linesToDisplay = useMemo(() => {
     if (!isStructured) {
       return logs.filter(line => {
         const s = typeof line === 'string' ? line : JSON.stringify(line);
         let matches = true;
-        if (level === 'error') matches = s.toUpperCase().includes('ERROR');
+        if (level === 'error') matches = s.toUpperCase().includes('ERROR') || s.toUpperCase().includes('FAIL');
         else if (level === 'warn') matches = s.toUpperCase().includes('WARN') || s.toUpperCase().includes('WARNING');
         
         if (matches && searchQuery.trim()) {
@@ -98,7 +154,7 @@ export default function Logs() {
     const lines = activeFile.content.split('\n');
     return lines.filter(line => {
       let matches = true;
-      if (level === 'error') matches = line.toUpperCase().includes('ERROR');
+      if (level === 'error') matches = line.toUpperCase().includes('ERROR') || line.toUpperCase().includes('FAIL');
       else if (level === 'warn') matches = line.toUpperCase().includes('WARN') || line.toUpperCase().includes('WARNING');
       
       if (matches && searchQuery.trim()) {
@@ -117,10 +173,30 @@ export default function Logs() {
     });
   };
 
+  const downloadLogFile = () => {
+    const text = linesToDisplay.join('\n');
+    if (!text) return;
+    const blob = new Blob([text], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = selectedFile || 'console.log';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
   const clearFilters = () => {
     setRound('');
     setLevel('all');
     setSearchQuery('');
+  };
+
+  // Theme styling definitions for Hacker terminal
+  const themeStyles = {
+    default: { background: '#040711', color: '#cbd5e1', border: '1px solid var(--border)' },
+    matrix: { background: '#020502', color: '#39ff14', textShadow: '0 0 4px rgba(57, 255, 20, 0.4)', border: '1px solid rgba(0, 200, 0, 0.2)' },
+    monokai: { background: '#272822', color: '#f8f8f2', border: '1px solid #1e1f1c' },
+    light: { background: '#f8fafc', color: '#0f172a', border: '1px solid #e2e8f0', boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.05)' }
   };
 
   if (error) {
@@ -144,7 +220,6 @@ export default function Logs() {
         </div>
         <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
           {/* File selector for structured logs */}
-          {/* 当有多份日志文件时，显示文件选择下拉框 */}
           {isStructured && filesList.length > 0 && (
             <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
               <span style={{ color: 'var(--text-dim)', fontSize: 13, fontWeight: 500 }}>日志文件:</span>
@@ -238,6 +313,29 @@ export default function Logs() {
         </div>
         
         <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
+          {/* Terminal Theme Selector */}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <span style={{ color: 'var(--text-dim)', fontSize: 13, fontWeight: 500 }}>主题:</span>
+            <select 
+              value={theme} 
+              onChange={e => setTheme(e.target.value)}
+              style={{ 
+                background: 'var(--bg-card)', 
+                border: '1px solid var(--border)', 
+                color: 'var(--text-bright)', 
+                padding: '6px 10px', 
+                borderRadius: 8, 
+                fontSize: 12, 
+                cursor: 'pointer'
+              }}
+            >
+              <option value="default">Midnight</option>
+              <option value="matrix">Matrix</option>
+              <option value="monokai">Monokai</option>
+              <option value="light">Light</option>
+            </select>
+          </div>
+
           <div style={{ display: 'flex', gap: 6, alignItems: 'center', background: 'rgba(255,255,255,0.02)', padding: '4px 8px', borderRadius: 8, border: '1px solid var(--border)' }}>
             <span style={{ color: 'var(--text-dim)', fontSize: 11, fontWeight: 600 }}>字号:</span>
             <button onClick={() => setFontSize(Math.max(10, fontSize - 1))} style={{ background: 'none', border: 'none', color: 'var(--text-normal)', cursor: 'pointer', padding: '2px 6px', fontWeight: 'bold' }}>A-</button>
@@ -255,10 +353,16 @@ export default function Logs() {
             自动滚动
           </label>
 
-          <button className="btn" onClick={copyToClipboard} style={{ fontSize: 12, padding: '8px 14px', borderRadius: 10, display: 'flex', gap: 6 }}>
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            {copying ? '已复制!' : '复制日志'}
-          </button>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn" onClick={copyToClipboard} style={{ fontSize: 12, padding: '8px 14px', borderRadius: 10, display: 'flex', gap: 6 }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+              {copying ? '已复制!' : '复制'}
+            </button>
+            <button className="btn" onClick={downloadLogFile} style={{ fontSize: 12, padding: '8px 14px', borderRadius: 10, display: 'flex', gap: 6 }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              下载
+            </button>
+          </div>
         </div>
       </div>
 
@@ -272,11 +376,11 @@ export default function Logs() {
           overflowY: 'auto', 
           fontFamily: "'JetBrains Mono', monospace", 
           fontSize: `${fontSize}px`,
-          background: '#040711',
-          border: '1px solid var(--border)',
           padding: '20px',
           borderRadius: '16px',
-          boxShadow: 'inset 0 4px 20px rgba(0, 0, 0, 0.6)'
+          boxShadow: theme === 'light' ? 'inset 0 1px 3px rgba(0,0,0,0.05)' : 'inset 0 4px 20px rgba(0, 0, 0, 0.6)',
+          transition: 'all 0.3s cubic-bezier(0.4, 0, 0.2, 1)',
+          ...themeStyles[theme]
         }}
       >
         {linesToDisplay.length === 0 ? (
@@ -285,16 +389,14 @@ export default function Logs() {
             <div>未找到匹配的日志内容 / No logs found</div>
           </div>
         ) : (
-          linesToDisplay.map((line, i) => {
-            const isError = line.toUpperCase().includes('ERROR');
-            const isWarn = line.toUpperCase().includes('WARN') || line.toUpperCase().includes('WARNING');
-            const cls = isError ? 'error' : isWarn ? 'warn' : '';
-            return (
-              <div key={i} className={`log-line ${cls}`} style={{ padding: '3px 8px' }}>
-                {line}
-              </div>
-            );
-          })
+          linesToDisplay.map((line, i) => (
+            <LogLine 
+              key={i} 
+              text={line} 
+              index={i} 
+              theme={theme} 
+            />
+          ))
         )}
       </div>
     </>
