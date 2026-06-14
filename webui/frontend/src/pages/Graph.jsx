@@ -3,20 +3,10 @@ import ReactFlow, { Background, Controls, MarkerType, useNodesState, useEdgesSta
 import 'reactflow/dist/style.css';
 import { api } from '../api';
 
-// 分支颜色映射表，对应 mainline=蓝, v3-anti-overfit=紫, v4-stabilize=绿
-const BRANCH_COLORS = {
-  'mainline': 'var(--blue)',        // 蓝色
-  'v3-anti-overfit': 'var(--purple)', // 紫色
-  'v4-stabilize': 'var(--green)',    // 绿色
-};
-
-// 获取分支颜色，非预设分支默认为黄/橙色
-const getBranchColor = (branch) => BRANCH_COLORS[branch] || 'var(--yellow)';
-
 // Custom Node Component to display model status in DAG
 // 自定义模型节点，在演化图中展示模型详细状态
 function ModelNode({ data, selected }) {
-  const branchColor = getBranchColor(data.branch);
+  const branchColor = data.branchColor || 'var(--blue)';
   const winrate = data.winrate || 0.5;
   
   // 胶囊形状的尺寸根据 winrate 动态调整 (winrate 越大，节点胶囊越宽)
@@ -100,6 +90,7 @@ export default function Graph() {
   const [selectedEdge, setSelectedEdge] = useState(null);
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [branches, setBranches] = useState([]);
 
   useEffect(() => {
     api.getGraph().then(g => {
@@ -117,6 +108,31 @@ export default function Graph() {
         if (b === 'mainline') return 1;
         return a.localeCompare(b);
       });
+
+      // Define a premium color palette
+      const BRANCH_PALETTE = [
+        'var(--blue)',    // mainline
+        'var(--purple)',
+        'var(--green)',
+        'var(--yellow)',
+        '#f43f5e',        // Rose/Pink
+        '#06b6d4',        // Cyan
+        '#f97316',        // Orange
+        '#ec4899',        // Magenta
+      ];
+
+      // Assign colors dynamically to branches
+      const branchColorsMap = {};
+      const branchesData = sortedBranches.map((br, index) => {
+        let color = 'var(--blue)';
+        if (br !== 'mainline') {
+          const colorIndex = 1 + ((index - 1) % (BRANCH_PALETTE.length - 1));
+          color = BRANCH_PALETTE[colorIndex];
+        }
+        branchColorsMap[br] = color;
+        return { name: br, color };
+      });
+      setBranches(branchesData);
 
       // Map branches to specific vertical positions (Y axis)
       // 将不同分支映射到特定的垂直偏移量
@@ -148,12 +164,16 @@ export default function Graph() {
         
         // Base Y: branch horizontal lane offset + stacked node index vertical offset
         const y = (branchYMap[branch] || 0) + stackIndex * 90;
+        const branchColor = branchColorsMap[branch] || 'var(--yellow)';
 
         return {
           id: n.hash,
           type: 'model',
           position: { x, y },
-          data: { ...n },
+          data: { 
+            ...n,
+            branchColor
+          },
         };
       });
 
@@ -163,7 +183,7 @@ export default function Graph() {
       // 路由连接线条，使用默认的 bezier (贝塞尔曲线) 并应用分支颜色
       setEdges((g.edges || []).map((e, i) => {
         const sourceBranch = nodeBranchMap[e.from] || 'mainline';
-        const edgeColor = getBranchColor(sourceBranch);
+        const edgeColor = branchColorsMap[sourceBranch] || 'var(--yellow)';
         
         return {
           id: `e-${i}`,
@@ -297,25 +317,17 @@ export default function Graph() {
         <div className="graph-canvas" style={{ flex: 1, background: 'rgba(11, 15, 25, 0.4)', borderRadius: 16, border: '1px solid var(--border)', overflow: 'hidden', position: 'relative' }}>
           
           {/* 分支图例面板 */}
-          <div className="graph-legend-container">
-            <div className="graph-legend-title">分支图例 / Branches</div>
-            <div className="graph-legend-item">
-              <span className="graph-legend-color" style={{ background: 'var(--blue)', boxShadow: '0 0 6px var(--blue)' }} />
-              <span>mainline (主干)</span>
+          {branches.length > 0 && (
+            <div className="graph-legend-container">
+              <div className="graph-legend-title">分支图例 / Branches</div>
+              {branches.map(br => (
+                <div key={br.name} className="graph-legend-item">
+                  <span className="graph-legend-color" style={{ background: br.color, boxShadow: `0 0 6px ${br.color}` }} />
+                  <span>{br.name === 'mainline' ? 'mainline (主干)' : br.name}</span>
+                </div>
+              ))}
             </div>
-            <div className="graph-legend-item">
-              <span className="graph-legend-color" style={{ background: 'var(--purple)', boxShadow: '0 0 6px var(--purple)' }} />
-              <span>v3-anti-overfit (防过拟合)</span>
-            </div>
-            <div className="graph-legend-item">
-              <span className="graph-legend-color" style={{ background: 'var(--green)', boxShadow: '0 0 6px var(--green)' }} />
-              <span>v4-stabilize (稳定版)</span>
-            </div>
-            <div className="graph-legend-item">
-              <span className="graph-legend-color" style={{ background: 'var(--yellow)', boxShadow: '0 0 6px var(--yellow)' }} />
-              <span>others (其它分支)</span>
-            </div>
-          </div>
+          )}
 
           <ReactFlow 
             nodes={nodes} 
