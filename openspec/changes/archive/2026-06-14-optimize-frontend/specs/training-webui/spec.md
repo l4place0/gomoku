@@ -1,16 +1,4 @@
-## Purpose
-Gomoku ML WebUI Front-end console specifications.
-## Requirements
-### Requirement: WebUI 后端 REST API
-系统 SHALL 提供 FastAPI 后端，暴露 REST API 端点。后端 SHALL 是 CLI 的薄壳，所有操作 SHALL 通过调用 CLI 子命令实现。端点 SHALL 包括 `GET /api/status`、`GET /api/progress`、`GET /api/graph`、`GET /api/models`、`GET /api/models/{hash}`、`POST /api/run`、`POST /api/branch`、`POST /api/merge`。
-
-#### Scenario: 查询状态
-- **WHEN** 前端请求 `GET /api/status`
-- **THEN** 后端调用 `mlevo status --json` 并返回结果
-
-#### Scenario: 启动训练
-- **WHEN** 前端请求 `POST /api/run` 带 `{"round": 11, "preset": "tiny"}`
-- **THEN** 后端调用 `mlevo run --round 11 --preset tiny --json` 并返回结果
+## MODIFIED Requirements
 
 ### Requirement: 仪表板视图
 WebUI SHALL 提供仪表板页面，显示当前训练状态（pipeline_state、current_round）、最近一轮结果（winrate、promoted）、训练进度（stage、pct、eta）。仪表板 SHALL 支持手动刷新（页面按钮）和自动轮询（可配置间隔，默认 30 秒）。仪表板 SHALL 具有响应式网格布局，支持大屏及移动端，且在数据加载时展示闪烁动画的骨架屏（Skeleton Loader）。仪表板还 SHALL 包含一个专门的“最近一轮 PK 结果”展示卡片，用于展示最近一轮的详细胜率、状态和父模型等信息。
@@ -64,15 +52,3 @@ WebUI SHALL 提供日志浏览页面，显示训练日志。日志 SHALL 按 rou
 #### Scenario: 终端日志自动滚动
 - **WHEN** 开启“自动滚动”复选框且日志追加新行
 - **THEN** 日志文本框视口自动滚动至底部
-
-### Requirement: 分支管理视图
-WebUI SHALL 提供分支管理页面，显示所有分支列表（名称、fork_from、最新 winrate、rounds 数）。页面 SHALL 支持创建分支和发起 PK 对决。
-
-#### Scenario: 查看分支列表
-- **WHEN** 用户打开分支管理页面
-- **THEN** 显示所有活跃分支和已 archive 的分支
-
-#### Scenario: 创建新分支
-- **WHEN** 用户选择一个历史模型并点击"创建分支"
-- **THEN** 调用 `mlevo branch --from {hash}` 并刷新分支列表
-
