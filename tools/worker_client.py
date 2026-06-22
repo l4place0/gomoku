@@ -142,6 +142,16 @@ class WorkerClient:
                 resp = json.loads(resp_line.strip())
                 return resp
             except json.JSONDecodeError:
+                # VCF solver prints error messages to stdout, polluting JSON response.
+                # Try to extract JSON from the end of the line.
+                stripped = resp_line.strip()
+                last_brace = stripped.rfind('{')
+                if last_brace >= 0:
+                    try:
+                        resp = json.loads(stripped[last_brace:])
+                        return resp
+                    except json.JSONDecodeError:
+                        pass
                 return {"status": "error", "error": f"JSON_PARSE_ERROR: {resp_line!r}"}
 
         return {"status": "error", "error": "MAX_RETRIES_EXCEEDED"}

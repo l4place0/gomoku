@@ -23,8 +23,9 @@ BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 LOG_DIR = BASE_DIR / "data" / "logs"
-PLANS_DIR = PROJECT_ROOT / "docs" / "ml" / "plans"
-ARCHIVE_DIR = PLANS_DIR / "archive"
+PLANS_DIR = PROJECT_ROOT / "docs" / "ml" / "plans"  # legacy, runtime data only
+CHANGES_DIR = PROJECT_ROOT / "docs" / "ml" / "changes"
+ARCHIVE_DIR = CHANGES_DIR / "archive"
 LEDGER_PATH = LOG_DIR / "evolution_ledger.json"
 STATE_PATH = LOG_DIR / "pipeline_state.json"
 PROGRESS_PATH = LOG_DIR / "progress.json"
@@ -38,10 +39,14 @@ PRESETS = {
     "tiny": {
         "sf_games": 5, "sf_visits": 8, "sh_samples": 100,
         "tr_epochs": 1, "pk_games": 4, "tr_batch": 16,
+        "tr_max_bucket_per_data": 8, "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": True,
     },
     "small": {
         "sf_games": 50, "sf_visits": 32, "sh_samples": 1000,
         "tr_epochs": 1, "pk_games": 10, "tr_batch": 32,
+        "tr_max_bucket_per_data": 8, "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": True,
     },
 }
 
@@ -278,7 +283,179 @@ class DecisionEngine:
         if decided.get("pk_games", 0) < s["min_pk_games_warn"]:
             warnings.append(f"pk_games ({decided['pk_games']}) below recommended {s['min_pk_games_warn']}")
 
+        # --- Regression response ---
+        regressions = s.get("regression_detected", [])
+        if regressions:
+            high_severity = [r for r in regressions if r.get("severity") == "high"]
+            if high_severity:
+                decided["tr_lr"] = max(s.get("lr_floor", 0.0001),
+                                       decided.get("tr_lr", 0.002) * s.get("regression_lr_decay", 0.8))
+                reasons.append(f"Regression response: LR decay to {decided['tr_lr']} (high severity)")
+                warnings.append(f"High severity regression detected: {high_severity[0]['type']}")
+            else:
+                boost = s.get("regression_entropy_boost", 1.2)
+                decided["sf_games"] = int(round(decided.get("sf_games", 500) * boost))
+                reasons.append(f"Regression response: sf_games boost to {decided['sf_games']} (medium severity)")
+
         return decided, reasons, warnings
+
+
+DEFAULT_REGRESSION_STRATEGY = {
+    "sudden_drop_threshold": 0.15,    # Single-round winrate drop threshold
+    "trend_decline_window": 3,        # Consecutive declining rounds to trigger
+    "ancestor_regression_margin": 0.10,  # How much worse than ancestor average
+    "regression_lr_decay": 0.8,       # Extra LR multiplier on regression
+    "regression_entropy_boost": 1.2,  # sf_games multiplier on regression
+    "elo_drop_threshold": 50,         # Elo drop threshold for high severity
+    "elo_trend_decline_window": 3,    # Consecutive declining Elo rounds
+}
+
+
+class RegressionDetector:
+    """Detects performance regressions in training history."""
+
+    def __init__(self, history, strategy=None):
+        self.history = history
+        self.strategy = {**DEFAULT_REGRESSION_STRATEGY, **(strategy or {})}
+
+    def _get_winrates(self):
+        """Extract (round, winrate) pairs from history for promoted models."""
+        pairs = []
+        for record in self.history:
+            pk = record.get("pk", {})
+            wr = pk.get("winrate")
+            if wr is not None:
+                pairs.append((record.get("round", 0), wr))
+        pairs.sort(key=lambda x: x[0])
+        return pairs
+
+    def detect_sudden_drop(self):
+        """Detect single-round winrate drop exceeding threshold."""
+        pairs = self._get_winrates()
+        if len(pairs) < 2:
+            return []
+        threshold = self.strategy["sudden_drop_threshold"]
+        regressions = []
+        for i in range(1, len(pairs)):
+            drop = pairs[i - 1][1] - pairs[i][1]
+            if drop > threshold:
+                regressions.append({
+                    "type": "sudden_drop",
+                    "severity": "high",
+                    "round": pairs[i][0],
+                    "winrate": pairs[i][1],
+                    "prev_winrate": pairs[i - 1][1],
+                    "drop": round(drop, 4),
+                })
+        return regressions
+
+    def detect_trend_decline(self):
+        """Detect consecutive winrate decline over a window."""
+        pairs = self._get_winrates()
+        window = self.strategy["trend_decline_window"]
+        if len(pairs) < window:
+            return []
+        regressions = []
+        # Check the last `window` entries for monotonically declining winrate
+        recent = pairs[-window:]
+        declining = all(recent[i][1] > recent[i + 1][1] for i in range(len(recent) - 1))
+        if declining:
+            total_drop = recent[0][1] - recent[-1][1]
+            regressions.append({
+                "type": "trend_decline",
+                "severity": "medium",
+                "window": window,
+                "start_round": recent[0][0],
+                "end_round": recent[-1][0],
+                "start_winrate": recent[0][1],
+                "end_winrate": recent[-1][1],
+                "total_drop": round(total_drop, 4),
+            })
+        return regressions
+
+    def detect_ancestor_regression(self):
+        """Detect if current winrate is significantly below ancestor average."""
+        pairs = self._get_winrates()
+        if len(pairs) < 3:
+            return []
+        margin = self.strategy["ancestor_regression_margin"]
+        current_wr = pairs[-1][1]
+        ancestor_wrs = [wr for _, wr in pairs[:-1]]
+        avg_ancestor = sum(ancestor_wrs) / len(ancestor_wrs)
+        regressions = []
+        if current_wr < avg_ancestor - margin:
+            regressions.append({
+                "type": "ancestor_regression",
+                "severity": "medium",
+                "current_winrate": current_wr,
+                "ancestor_avg_winrate": round(avg_ancestor, 4),
+                "gap": round(avg_ancestor - current_wr, 4),
+            })
+        return regressions
+
+    def _get_elo_diffs(self):
+        """Extract (round, elo_diff) pairs from history."""
+        pairs = []
+        for record in self.history:
+            pk = record.get("pk", {})
+            ed = pk.get("elo_diff")
+            if ed is not None:
+                pairs.append((record.get("round", 0), ed))
+        pairs.sort(key=lambda x: x[0])
+        return pairs
+
+    def detect_elo_drop(self):
+        """Detect single-round Elo drop exceeding threshold."""
+        pairs = self._get_elo_diffs()
+        if len(pairs) < 2:
+            return []
+        threshold = self.strategy["elo_drop_threshold"]
+        regressions = []
+        for i in range(1, len(pairs)):
+            drop = pairs[i - 1][1] - pairs[i][1]
+            if drop > threshold:
+                regressions.append({
+                    "type": "elo_drop",
+                    "severity": "high",
+                    "round": pairs[i][0],
+                    "elo_diff": pairs[i][1],
+                    "prev_elo_diff": pairs[i - 1][1],
+                    "drop": round(drop, 1),
+                })
+        return regressions
+
+    def detect_elo_trend_decline(self):
+        """Detect consecutive Elo decline over a window."""
+        pairs = self._get_elo_diffs()
+        window = self.strategy["elo_trend_decline_window"]
+        if len(pairs) < window:
+            return []
+        recent = pairs[-window:]
+        declining = all(recent[i][1] > recent[i + 1][1] for i in range(len(recent) - 1))
+        regressions = []
+        if declining:
+            total_drop = recent[0][1] - recent[-1][1]
+            regressions.append({
+                "type": "elo_trend_decline",
+                "severity": "medium",
+                "window": window,
+                "start_round": recent[0][0],
+                "end_round": recent[-1][0],
+                "start_elo": recent[0][1],
+                "end_elo": recent[-1][1],
+                "total_drop": round(total_drop, 1),
+            })
+        return regressions
+
+    def detect(self):
+        """Run all detection methods and return combined results."""
+        results = []
+        results += self.detect_sudden_drop()
+        results += self.detect_trend_decline()
+        results += self.detect_ancestor_regression()
+        results += self.detect_elo_drop()
+        results += self.detect_elo_trend_decline()
+        return results
 
 
 # --- Ledger ---
@@ -294,7 +471,7 @@ def save_ledger(ledger):
 # --- Plan helpers ---
 
 def get_plan_dir(plan_name):
-    return PLANS_DIR / plan_name
+    return CHANGES_DIR / plan_name
 
 
 def find_plan(plan_name=None):
@@ -304,8 +481,8 @@ def find_plan(plan_name=None):
             return plan_name, plan_dir
         _error(f"Plan '{plan_name}' not found")
     active_plans = []
-    if PLANS_DIR.exists():
-        for item in PLANS_DIR.iterdir():
+    if CHANGES_DIR.exists():
+        for item in CHANGES_DIR.iterdir():
             if item.is_dir() and item.name != "archive":
                 active_plans.append(item)
     if len(active_plans) == 1:
@@ -447,13 +624,21 @@ def cmd_run(args):
                 strategy = {**strategy, **json.loads(cli_strategy)}
             except json.JSONDecodeError:
                 _error(f"Invalid --strategy JSON: {cli_strategy}")
+        # Regression detection before DecisionEngine
+        detector = RegressionDetector(history, strategy=strategy)
+        regressions = detector.detect()
+        if regressions:
+            strategy["regression_detected"] = regressions
+            for r in regressions:
+                print(f"  [Regression] {r['type']}: severity={r['severity']}", flush=True)
         engine = DecisionEngine(stage_config, history, strategy=strategy)
         decided_params, _, _ = engine.decide(round_no)
-        decided_params["round"] = round_no
-        decided_params["model_name"] = plan_config.get("model_kind", "b10c128")
-        decided_params["tr_kind"] = plan_config.get("model_kind", "b10c128")
-        decided_params["pk_threshold"] = plan_config.get("promotion_threshold", 0.55)
-        params = decided_params
+        # Merge stage_config as base, then overlay decided params
+        params = {**stage_config, **decided_params}
+        params["round"] = round_no
+        params["model_name"] = plan_config.get("model_kind", "b10c128")
+        params["tr_kind"] = plan_config.get("model_kind", "b10c128")
+        params["pk_threshold"] = plan_config.get("promotion_threshold", 0.55)
     else:
         params = PRESETS.get(preset, PRESETS["tiny"]).copy()
         params["round"] = round_no
@@ -651,11 +836,12 @@ def cmd_pk(args):
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, cwd=str(BASE_DIR))
         # Parse result from stdout
-        pk_result = {"winner": branch_a, "winrate": 0.5, "games_played": games}
+        pk_result = {"winner": branch_a, "winrate": 0.5, "games_played": games, "status": "parse_error"}
         try:
             pk_result = json.loads(result.stdout.strip().split("\n")[-1])
+            pk_result["status"] = "ok"
         except (json.JSONDecodeError, IndexError):
-            pass
+            print(f"[Warning] Failed to parse PK stdout, using default winrate=0.5", file=sys.stderr)
         _output(pk_result, True)
     except Exception as e:
         _output({"error": str(e)}, True)
@@ -889,6 +1075,11 @@ def cmd_decide(args):
 
     history = load_ledger()
     strategy = plan_config.get("strategy", {})
+    # Regression detection before DecisionEngine
+    detector = RegressionDetector(history, strategy=strategy)
+    regressions = detector.detect()
+    if regressions:
+        strategy["regression_detected"] = regressions
     engine = DecisionEngine(stage_config, history, strategy=strategy)
     decided_params, reasons, warnings = engine.decide(next_round)
     decided_params["round"] = next_round
@@ -907,7 +1098,7 @@ def cmd_decide(args):
 
 
 def cmd_new(args):
-    """Scaffold a new evolution plan."""
+    """Scaffold a new evolution plan under docs/ml/changes/."""
     plan_name = args.name
     plan_dir = get_plan_dir(plan_name)
     if plan_dir.exists():
@@ -931,8 +1122,8 @@ def cmd_new(args):
 def cmd_list(args):
     """List active and archived plans."""
     active = []
-    if PLANS_DIR.exists():
-        active = [d.name for d in PLANS_DIR.iterdir() if d.is_dir() and d.name != "archive"]
+    if CHANGES_DIR.exists():
+        active = [d.name for d in CHANGES_DIR.iterdir() if d.is_dir() and d.name != "archive"]
     archived = []
     if ARCHIVE_DIR.exists():
         archived = [d.name for d in ARCHIVE_DIR.iterdir() if d.is_dir()]
@@ -1057,7 +1248,7 @@ def cmd_report(args):
     plan_name = args.name
     # Try active plans first, then archived
     plan_dir = None
-    active_dir = PLANS_DIR / plan_name
+    active_dir = CHANGES_DIR / plan_name
     if active_dir.exists() and active_dir.is_dir():
         plan_dir = active_dir
     else:

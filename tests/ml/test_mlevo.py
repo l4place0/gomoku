@@ -6,7 +6,7 @@ import shutil
 import re
 from pathlib import Path
 
-from ml.mlevo_cli import DecisionEngine, cmd_new, find_plan, load_ledger, PLANS_DIR, ARCHIVE_DIR
+from ml.mlevo_cli import DecisionEngine, cmd_new, find_plan, load_ledger, CHANGES_DIR, ARCHIVE_DIR
 
 @pytest.fixture
 def base_config():
@@ -142,9 +142,10 @@ def test_decision_engine_guardrails(base_config):
     assert any("pk_games (10) below recommended" in w for w in warnings)
 
 def test_scaffold_new_plan(tmp_path, monkeypatch):
-    # Mock PLANS_DIR to a temporary folder
-    temp_plans_dir = tmp_path / "plans"
-    monkeypatch.setattr("ml.mlevo_cli.PLANS_DIR", temp_plans_dir)
+    # Mock CHANGES_DIR to a temporary folder
+    temp_plans_dir = tmp_path / "changes"
+    monkeypatch.setattr("ml.mlevo_cli.CHANGES_DIR", temp_plans_dir)
+    monkeypatch.setattr("ml.mlevo_cli.ARCHIVE_DIR", temp_plans_dir / "archive")
     monkeypatch.setattr("ml.mlevo_cli.get_plan_dir", lambda name: temp_plans_dir / name)
 
     class Args:

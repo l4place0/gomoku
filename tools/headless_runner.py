@@ -15,7 +15,13 @@ import ctypes
 import argparse
 import time
 import math
+from pathlib import Path
 from typing import List, Tuple, Optional
+
+# Ensure project root is in sys.path for module imports
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 from tools.worker_client import WorkerClient
 
@@ -308,11 +314,13 @@ def main():
     baseline_white_wins = 0    # baseline wins when playing white
     last_white_model = None    # track last white model to avoid unnecessary reloads
 
-    # Initialize environment
-    env = dll.GetGameEngine()
-
     try:
         for game_idx in range(args.games):
+            # Release previous engine and get a fresh one for clean board state
+            if game_idx > 0:
+                dll.ReleaseEngine(env)
+            env = dll.GetGameEngine()
+
             # Alternate colors: even games → candidate=black, odd games → baseline=black
             candidate_is_black = (game_idx % 2 == 0)
             if candidate_is_black:
@@ -324,12 +332,7 @@ def main():
                 current_white_model = args.black_model  # candidate
                 print(f"\n[Game {game_idx + 1}/{args.games}] Starting... (baseline=BLACK, candidate=WHITE)")
 
-            # 彻底擦除单例引擎上上一局残留的所有棋子
-            if active_history:
-                print(f"  [Reset] Undoing {len(active_history)} stones from previous game...")
-                for x, y, r in reversed(active_history):
-                    dll.UndoMove(env, x, y, r)
-                active_history.clear()
+            active_history.clear()
 
             # Load black model for this game
             if current_black_model:
@@ -417,7 +420,7 @@ def main():
                     # Built-in Black AI MCTS search
                     if set_kata_enabled is not None:
                         set_kata_enabled(env, True)
-                        set_kata_search_params(env, args.visits_black, 0.0, 0.6, 0.6)
+                        set_kata_search_params(env, args.visits_black, 0.0, 0.3, 0.3)
                     arr = (AIMove * 10)()
                     cnt = dll.GetTopMoves(env, BLACK, arr, 10)
                     if cnt > 0:
@@ -452,7 +455,7 @@ def main():
                             # Attempt to restart worker and retry once
                             print("  [Recovery] Worker crashed, restarting...")
                             white_worker_client.close()
-                            white_worker_client = _start_white_worker(args.white_model)
+                            white_worker_client = _start_white_worker(current_white_model)
                             if white_worker_client is not None:
                                 white_worker_client.reset_board()
                                 resp2 = white_worker_client.query(history, args.visits_white, 0.3, 0.3, "MCTS", WHITE)

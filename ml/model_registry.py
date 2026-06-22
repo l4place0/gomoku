@@ -34,6 +34,7 @@ class ModelRecord:
     timestamp: str = ""  # ISO 8601
     file: str = ""  # relative path to model file
     sprt_result: Optional[dict] = None  # SPRT evaluation result
+    elo: Optional[float] = None  # MLE Elo rating
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -44,6 +45,8 @@ class ModelRecord:
         # Handle missing fields for backward compatibility
         if "sprt_result" not in data:
             data["sprt_result"] = None
+        if "elo" not in data:
+            data["elo"] = None
         return cls(**data)
 
 
@@ -122,6 +125,21 @@ class ModelRegistry:
         chain.reverse()
         return chain
 
+    def get_ancestor_at_depth(self, model_hash: str, depth: int) -> Optional[ModelRecord]:
+        """Get ancestor at specified depth. depth=1 is parent, depth=2 is grandparent, etc."""
+        current = self.find_by_hash(model_hash)
+        for _ in range(depth):
+            if not current or not current.parent:
+                return None
+            current = self.find_by_hash(current.parent)
+        return current
+
+    def get_winrate_trend(self, branch: str = "mainline", window: int = 5) -> list[float]:
+        """Get winrate history for the last N promoted models on a branch."""
+        records = [r for r in self.find_by_branch(branch) if r.promoted]
+        records.sort(key=lambda r: r.round)
+        return [r.winrate for r in records[-window:]]
+
     def _check_cycle(self, new_hash: str, parent_hash: str) -> None:
         """Raise ValueError if setting parent would create a cycle."""
         # Walk from parent to root, check if new_hash appears
@@ -184,3 +202,29 @@ class ModelRegistry:
         if min_winrate is not None:
             results = [r for r in results if r.winrate >= min_winrate]
         return results
+
+    def get_elo_ranking(self) -> list[ModelRecord]:
+        """Get all models sorted by Elo rating descending (None Elo sorted last)."""
+        records = self.read_all()
+        records_with_elo = [r for r in records if r.elo is not None]
+        records_without_elo = [r for r in records if r.elo is None]
+        records_with_elo.sort(key=lambda r: -r.elo)
+        return records_with_elo + records_without_elo
+
+    def update_elo(self, model_hash: str, elo: float) -> bool:
+        """Update the Elo rating for a model in the registry.
+
+        Reads all records, modifies the target, rewrites the file.
+        Returns True if the model was found and updated.
+        """
+        records = self.read_all()
+        updated = False
+        for record in records:
+            if record.hash == model_hash:
+                record.elo = elo
+                updated = True
+        if updated:
+            with open(self.registry_path, "w", encoding="utf-8") as f:
+                for record in records:
+                    f.write(record.to_json() + "\n")
+        return updated

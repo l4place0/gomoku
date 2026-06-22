@@ -3,6 +3,7 @@ import ErrorBoundary from './components/ErrorBoundary';
 import Dashboard from './pages/Dashboard';
 import Graph from './pages/Graph';
 import Models from './pages/Models';
+import Plans from './pages/Plans';
 import Logs from './pages/Logs';
 import './App.css';
 
@@ -15,6 +16,7 @@ function App() {
           <NavLink to="/" end>Dashboard</NavLink>
           <NavLink to="/graph">Graph</NavLink>
           <NavLink to="/models">Models</NavLink>
+          <NavLink to="/plans">Plans</NavLink>
           <NavLink to="/logs">Logs</NavLink>
         </nav>
         <main className="content">
@@ -23,6 +25,7 @@ function App() {
               <Route path="/" element={<Dashboard />} />
               <Route path="/graph" element={<Graph />} />
               <Route path="/models" element={<Models />} />
+              <Route path="/plans" element={<Plans />} />
               <Route path="/logs" element={<Logs />} />
             </Routes>
           </ErrorBoundary>

@@ -16,6 +16,8 @@ from tkinter import filedialog, messagebox, ttk
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 KATA_ROOT = PROJECT_ROOT / "KataGomo"
 PY_DIR = KATA_ROOT / "python"
 DEFAULT_DATA_DIR = KATA_ROOT / "training_data"

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gomoku ML Training Console</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', monospace; background: #0d1117; color: #c9d1d9; padding: 20px; }
+h1 { color: #58a6ff; margin-bottom: 20px; }
+.card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.card h2 { color: #58a6ff; font-size: 14px; text-transform: uppercase; margin-bottom: 12px; }
+.status-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #21262d; }
+.status-row:last-child { border-bottom: none; }
+.label { color: #8b949e; }
+.value { color: #c9d1d9; font-weight: 600; }
+.value.running { color: #3fb950; }
+.value.idle { color: #8b949e; }
+.value.promoted { color: #3fb950; }
+.value.discarded { color: #f85149; }
+table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid #21262d; }
+th { color: #8b949e; font-size: 12px; text-transform: uppercase; }
+td { font-size: 14px; }
+.winrate { font-weight: 700; }
+.winrate.high { color: #3fb950; }
+.winrate.mid { color: #d29922; }
+.winrate.low { color: #f85149; }
+.refresh-btn { background: #21262d; color: #c9d1d9; border: 1px solid #30363d; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
+.refresh-btn:hover { background: #30363d; }
+#loading { color: #8b949e; }
+</style>
+</head>
+<body>
+<h1>Gomoku ML Training Console</h1>
+<button class="refresh-btn" onclick="refresh()">Refresh</button>
+<span id="loading"></span>
+
+<div class="card">
+<h2>Pipeline Status</h2>
+<div id="status">Loading...</div>
+</div>
+
+<div class="card">
+<h2>Models (v4-stabilize branch)</h2>
+<div id="models">Loading...</div>
+</div>
+
+<script>
+const API = '';
+
+async function fetchJSON(url) {
+  const r = await fetch(API + url);
+  return r.json();
+}
+
+function winrateClass(wr) {
+  if (wr >= 0.7) return 'high';
+  if (wr >= 0.55) return 'mid';
+  return 'low';
+}
+
+async function refresh() {
+  document.getElementById('loading').textContent = 'Loading...';
+  try {
+    const [status, models] = await Promise.all([
+      fetchJSON('/api/status'),
+      fetchJSON('/api/models')
+    ]);
+    renderStatus(status);
+    renderModels(models);
+  } catch(e) {
+    document.getElementById('loading').textContent = 'Error: ' + e.message;
+  }
+  document.getElementById('loading').textContent = '';
+}
+
+function renderStatus(s) {
+  const m = s.current_model || {};
+  document.getElementById('status').innerHTML = `
+    <div class="status-row"><span class="label">State</span><span class="value ${s.pipeline_state}">${s.pipeline_state}</span></div>
+    <div class="status-row"><span class="label">Current Round</span><span class="value">${s.current_round || '-'}</span></div>
+    <div class="status-row"><span class="label">Best Model</span><span class="value">${m.hash || '-'}</span></div>
+    <div class="status-row"><span class="label">Best Winrate</span><span class="value winrate ${winrateClass(m.winrate || 0)}">${(m.winrate * 100).toFixed(1)}%</span></div>
+    <div class="status-row"><span class="label">Total Models</span><span class="value">${s.model_registry_count}</span></div>
+    <div class="status-row"><span class="label">Ledger Rounds</span><span class="value">${s.ledger_rounds}</span></div>
+  `;
+}
+
+function renderModels(data) {
+  const models = data.models || [];
+  const v4 = models.filter(m => m.branch === 'v4-stabilize').reverse();
+  let html = `<table>
+    <tr><th>Round</th><th>Hash</th><th>Winrate</th><th>Status</th></tr>`;
+  for (const m of v4) {
+    html += `<tr>
+      <td>${m.round}</td>
+      <td><code>${m.hash}</code></td>
+      <td class="winrate ${winrateClass(m.winrate)}">${(m.winrate * 100).toFixed(1)}%</td>
+      <td class="${m.promoted ? 'promoted' : 'discarded'}">${m.promoted ? 'PROMOTED' : 'discarded'}</td>
+    </tr>`;
+  }
+  html += '</table>';
+  document.getElementById('models').innerHTML = html;
+}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>

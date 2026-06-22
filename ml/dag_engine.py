@@ -177,3 +177,28 @@ class DAGEngine:
             b["rounds"] = max(b["rounds"], r.round)
             b["latest_winrate"] = r.winrate
         return dict(branches)
+
+    def get_branch_elo_summary(self) -> dict:
+        """Get branch-level Elo summary.
+
+        Returns {branch: {avg_elo, best_elo, best_model, model_count}}.
+        """
+        records = self.registry.read_all()
+        branches = defaultdict(lambda: {"elos": [], "best_elo": None, "best_model": None})
+        for r in records:
+            b = branches[r.branch]
+            if r.elo is not None:
+                b["elos"].append(r.elo)
+                if b["best_elo"] is None or r.elo > b["best_elo"]:
+                    b["best_elo"] = r.elo
+                    b["best_model"] = r.hash
+        result = {}
+        for branch, data in branches.items():
+            elos = data["elos"]
+            result[branch] = {
+                "avg_elo": round(sum(elos) / len(elos), 1) if elos else None,
+                "best_elo": round(data["best_elo"], 1) if data["best_elo"] is not None else None,
+                "best_model": data["best_model"],
+                "model_count": len(elos),
+            }
+        return result

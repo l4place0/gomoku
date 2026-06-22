@@ -53,7 +53,6 @@ def _reset_board_state():
 
 def _init_vcf():
     """Initialize VCF solver by doing a dummy move cycle to ensure zob_board is set."""
-    # Play center move and undo to trigger board initialization
     cx, cy, cr = 7, 7, 0
     dll.DoMove(env, cx, cy, cr)
     dll.UndoMove(env, cx, cy, cr)
@@ -133,6 +132,8 @@ def main():
                 for x, y, r in received_history:
                     dll.DoMove(env, x, y, r)
                 local_history = received_history
+                # Re-initialize VCF solver zob_board after board sync
+                _init_vcf()
                 
                 # 设置当前 AI 搜索参数
                 visits = req.get("visits", 64)

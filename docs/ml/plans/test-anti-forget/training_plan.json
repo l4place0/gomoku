@@ -1,0 +1,47 @@
+{
+  "plan_name": "test-anti-forget",
+  "total_rounds": 5,
+  "model_kind": "b10c128",
+  "promotion_threshold": 0.55,
+  "initial_model": "8ac43499f1be",
+  "stages": [
+    {
+      "start_round": 1,
+      "end_round": 5,
+      "config": {
+        "sf_games": 5,
+        "sf_visits": 16,
+        "sh_samples": 100,
+        "tr_lr": 0.002,
+        "tr_batch": 16,
+        "tr_epochs": 1,
+        "pk_games": 4,
+        "sf_threads": 4,
+        "sh_threads": 2,
+        "pk_visits_b": 16,
+        "pk_visits_w": 16,
+        "pk_threshold": 0.55,
+        "pk_min_games": 4,
+        "tr_max_bucket_per_data": 8,
+        "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": true,
+        "replay_ratio": 0.2,
+        "replay_max_rounds": 5,
+        "pk_regression": true,
+        "pk_regression_games": 4,
+        "pk_regression_threshold": 0.40,
+        "pk_regression_depth": 2,
+        "tr_pos_len": 15,
+        "tr_soft_policy_weight_scale": 8.0,
+        "tr_value_loss_scale": 0.6,
+        "tr_td_value_loss_scales": "0.6,0.6,0.6",
+        "tr_lookahead_alpha": 0.5,
+        "tr_lookahead_k": 6,
+        "tr_swa_scale": 1.0,
+        "sh_expand_window_per_row": 0.3,
+        "sh_taper_window_exponent": 0.8,
+        "sh_approx_rows_per_file": 50000
+      }
+    }
+  ]
+}

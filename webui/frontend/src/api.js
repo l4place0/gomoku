@@ -32,4 +32,5 @@ export const api = {
   startRun: (data) => fetchJSON('/run', { method: 'POST', body: JSON.stringify(data) }),
   createBranch: (data) => fetchJSON('/branch', { method: 'POST', body: JSON.stringify(data) }),
   mergeBranch: (data) => fetchJSON('/merge', { method: 'POST', body: JSON.stringify(data) }),
+  getChangeMarkdown: (planName, filename) => fetchJSON(`/changes/${planName}/markdown/${filename}`),
 };

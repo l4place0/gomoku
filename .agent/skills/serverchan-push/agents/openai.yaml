@@ -1,0 +1,4 @@
+interface:
+  display_name: "ServerChan Push"
+  short_description: "Send ServerChan notification pushes from Codex workflows."
+  default_prompt: "Send a ServerChan notification with a title and message."

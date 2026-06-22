@@ -168,7 +168,7 @@ export default function Dashboard() {
       {/* 进度、模型详情与最近 PK 卡片布局 */}
       <div className="grid grid-2" style={{ marginTop: 24 }}>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-          {progress && progress.stage && (
+          {progress && progress.stage && status.pipeline_state !== 'idle' && (
             <div className="card" style={{ marginBottom: 0 }}>
               <h2>
                 <span className="dot" style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: 'var(--green)', boxShadow: '0 0 8px var(--green)', marginRight: 2 }} />

@@ -1,0 +1,78 @@
+{
+  "timestamp": "2026-06-15T18:30:00+08:00",
+  "source": "docs/ml/ + ml/data/",
+  "dashboard": {
+    "pipeline_state": "idle",
+    "current_plan": "test-anti-forget",
+    "current_round": 5,
+    "total_models": 18,
+    "promoted": 7,
+    "failed": 11,
+    "best_model": "94dc157a7f86",
+    "best_winrate": 0.7292,
+    "branches": ["test", "v4-cont", "test_02"],
+    "active_branch": "test_02"
+  },
+  "analysis": {
+    "convergence": "plateau",
+    "overfitting_risk": "low",
+    "lr_trend": "decaying",
+    "consecutive_failures": 0,
+    "plateau_rounds": 3,
+    "lr_current": 0.00022478848,
+    "lr_range_recommended": [0.001, 0.002],
+    "lr_below_nan_threshold": true
+  },
+  "bottlenecks": [
+    {
+      "type": "lr_plateau",
+      "description": "LR decayed from 0.0016 to 0.000225 over 5 rounds (7x reduction), now below FP16 NaN threshold (0.00025)",
+      "severity": "high",
+      "evidence": "test_02 R1-R5: 0.0016 → 0.000896 → 0.000502 → 0.000281 → 0.000225",
+      "suggested_action": "Reset LR to 0.001 (training-knowledge recommended range)"
+    },
+    {
+      "type": "data_insufficiency",
+      "description": "sh_samples=1000 is only 2% of recommended minimum (50000). Model cannot learn effectively.",
+      "severity": "high",
+      "evidence": "test_02 R1-R5 all use sh_samples=1000, training-knowledge recommends >= 50000",
+      "suggested_action": "Increase sh_samples to 50000+"
+    },
+    {
+      "type": "pk_unreliable",
+      "description": "PK with 20 games has ±15% confidence interval. Many 50% winrates are noise.",
+      "severity": "medium",
+      "evidence": "test_02 R2-R3 show 50% winrate with 20 games, R4-R5 show 55% (within noise range)",
+      "suggested_action": "Increase pk_games to 100 for ±8% confidence interval"
+    },
+    {
+      "type": "color_bias",
+      "description": "PK shows severe color bias: Black wins 85% (17/20 in R4 and R5). Candidate wins may be from playing Black.",
+      "severity": "medium",
+      "evidence": "R4 PK log: Black Wins: 17 | White Wins: 3; R5 PK log: Black Wins: 17 | White Wins: 3",
+      "suggested_action": "Use symmetric pk_visits (128/128) and verify color balance in results"
+    }
+  ],
+  "exploration_notes": "Explored test_02 branch LR decay history, PK logs, and training logs. Referenced deep-research report on KataGo pipeline optimization. Key findings: (1) LR decay is too aggressive, (2) data volume is critically low, (3) PK evaluation is unreliable due to small sample size and color bias, (4) GTX 1650 Ti lacks Tensor Cores so FP16 gains are memory-only.",
+  "recommendations": [
+    "Reset LR to 0.001 (training-knowledge sweet spot #2: 0.001-0.002)",
+    "Increase sh_samples to 50000+ (minimum for effective b10c128 learning)",
+    "Increase pk_games to 100 (±8% confidence interval vs current ±15%)",
+    "Use symmetric pk_visits=128/128 (eliminate color bias)",
+    "Increase tr_batch to 64 (better GPU utilization on GTX 1650 Ti)",
+    "Increase sf_games to 600 (more training data per round)",
+    "Monitor for NaN at LR=0.001 (DecisionEngine will auto-reduce if needed)",
+    "Created new plan: test02-param-fix (5 rounds with fixed parameters)"
+  ],
+  "reference_report": {
+    "path": "/home/l4p/deep-research/Research/00000000-000000-question-KataGo-训练流水线在单-G/report.md",
+    "key_findings": [
+      "MPS not available on consumer GPUs (GTX 1650 Ti)",
+      "Batch size can be safely reduced to 64 (fixup removed batch norm)",
+      "FP16 primary benefit is memory savings, not compute speedup (no Tensor Cores)",
+      "KataGo uses custom streaming generator, not PyTorch DataLoader",
+      "Shuffle can run asynchronously via shuffle_and_export_loop.sh",
+      "One-round data staleness is tolerable with Policy Surprise Weighting"
+    ]
+  }
+}
