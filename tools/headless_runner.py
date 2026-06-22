@@ -13,10 +13,55 @@ import os
 import json
 import ctypes
 import argparse
-import subprocess
 import time
 import math
+from pathlib import Path
 from typing import List, Tuple, Optional
+
+# Ensure project root is in sys.path for module imports
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from tools.worker_client import WorkerClient
+
+# SPRT: use ml/sprt.py if available, fall back to local implementation
+try:
+    from ml.sprt import sprt_check as _sprt_check, compute_sprt_result
+    _HAS_SPRT_MODULE = True
+except ImportError:
+    _HAS_SPRT_MODULE = False
+
+    def _sprt_check(wins, losses, alpha=0.05, beta=0.05, elo_diff=35):
+        if wins + losses < 1:
+            return None
+        p1 = 1.0 / (1.0 + 10.0 ** (-elo_diff / 400.0))
+        p0 = 0.5
+        llr = 0.0
+        if wins > 0:
+            llr += wins * math.log(p1 / p0)
+        if losses > 0:
+            llr += losses * math.log((1 - p1) / (1 - p0))
+        a = math.log(beta / (1 - alpha))
+        b = math.log((1 - beta) / alpha)
+        if llr >= b:
+            return "candidate_wins"
+        elif llr <= a:
+            return "baseline_wins"
+        return None
+
+    def compute_sprt_result(wins, losses, alpha=0.05, beta=0.05, elo_diff=35.0):
+        total = wins + losses
+        winrate = wins / total if total > 0 else 0.5
+        decision_raw = _sprt_check(wins, losses, alpha, beta, elo_diff)
+        decision = "accept" if decision_raw == "candidate_wins" else "reject" if decision_raw == "baseline_wins" else "undecided"
+        return type("SPRTResult", (), {
+            "decision": decision, "llr": 0.0, "elo_diff": 0.0,
+            "ci_lower": 0.0, "ci_upper": 0.0, "winrate": winrate,
+            "wins": wins, "losses": losses, "total": total,
+            "to_dict": lambda self: {"decision": self.decision, "winrate": self.winrate,
+                                     "wins": self.wins, "losses": self.losses, "total": self.total}
+        })()
 
 # Constants
 BOARD_SIZE = 15
@@ -77,6 +122,7 @@ dll.GetTopMoves.restype = ctypes.c_int
 dll.ReleaseEngine.argtypes = [ctypes.POINTER(GameEngine)]
 
 # Load opening book
+sys.path.insert(0, PROJECT_ROOT)
 from ml.verify_opening_book import OpeningBook
 try:
     opening_book = OpeningBook(OPENING_BOOK_PATH)
@@ -84,85 +130,21 @@ except Exception as e:
     print(f"[Warning] Failed to load opening book: {e}")
     opening_book = None
 
-# Global handle for white worker process
-white_worker_process = None
+# Global handle for white worker client
+white_worker_client: Optional[WorkerClient] = None
 
-def _reload_white_worker_process(white_model_path: str):
-    global white_worker_process
-    if white_worker_process is not None:
-        try:
-            white_worker_process.stdin.write("quit\n")
-            white_worker_process.stdin.flush()
-            white_worker_process.terminate()
-            white_worker_process.wait(timeout=1.0)
-        except Exception:
-            pass
-        white_worker_process = None
-        
+def _start_white_worker(white_model_path: str) -> Optional[WorkerClient]:
+    """Start a WorkerClient for the given white model."""
     if not white_model_path:
-        return
-        
-    print(f"[Worker] Spawning White AI Worker with model: {white_model_path}")
-    worker_script = os.path.join(BASE_DIR, "ai_worker.py")
-    # Ensure subprocess inherits GPU library paths (WSL2 + cuDNN)
-    worker_env = os.environ.copy()
-    wsl_lib = "/usr/lib/wsl/lib"
-    if os.path.isdir(wsl_lib) and "LD_LIBRARY_PATH" not in worker_env.get("LD_LIBRARY_PATH", ""):
-        worker_env["LD_LIBRARY_PATH"] = wsl_lib + ":" + worker_env.get("LD_LIBRARY_PATH", "")
-    cudnn_lib = os.path.join(BASE_DIR, ".venv", "lib", f"python3.{sys.version_info.minor}", "site-packages", "nvidia", "cudnn", "lib")
-    if os.path.isdir(cudnn_lib):
-        worker_env["LD_LIBRARY_PATH"] = cudnn_lib + ":" + worker_env.get("LD_LIBRARY_PATH", "")
-    worker_env["CUDA_VISIBLE_DEVICES"] = "0"
-    try:
-        white_worker_process = subprocess.Popen(
-            [sys.executable, worker_script, white_model_path, KATA_CONFIG_PATH],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-            env=worker_env
-        )
-        ready_line = white_worker_process.stdout.readline()
-        if ready_line:
-            status = json.loads(ready_line.strip())
-            if status.get("status") == "ready":
-                print("[Worker] White AI Worker successfully initialized and ready!")
-            else:
-                print(f"[Worker] Subprocess startup abnormal: {status}")
-    except Exception as e:
-        print(f"[Worker] Failed to start subprocess: {e}")
-        white_worker_process = None
-
-def _query_white_worker_move(history: List[Tuple[int, int, int]], visits: int, policy: float, value: float, engine: str) -> Optional[Tuple[int, int, int]]:
-    global white_worker_process
-    if white_worker_process is None:
         return None
-        
-    req = {
-        "action": "search",
-        "history": [[int(x), int(y), int(r)] for x, y, r in history],
-        "visits": int(visits),
-        "policy": float(policy),
-        "value": float(value),
-        "engine": str(engine),
-        "role": int(WHITE)
-    }
-    
-    try:
-        white_worker_process.stdin.write(json.dumps(req) + "\n")
-        white_worker_process.stdin.flush()
-        
-        resp_line = white_worker_process.stdout.readline()
-        if resp_line:
-            resp = json.loads(resp_line.strip())
-            if resp.get("status") == "ok":
-                return int(resp["x"]), int(resp["y"]), int(resp["score"])
-            else:
-                print(f"[Worker] Search error: {resp.get('error')}")
-    except Exception as e:
-        print(f"[Worker] IPC failed: {e}")
-    return None
+    print(f"[Worker] Spawning White AI Worker with model: {white_model_path}")
+    client = WorkerClient(white_model_path, KATA_CONFIG_PATH, timeout=10.0, max_retries=2)
+    if client.start():
+        print("[Worker] White AI Worker successfully initialized and ready!")
+        return client
+    else:
+        print("[Worker] Failed to start White AI Worker")
+        return None
 
 def is_symmetric(pos1, pos2, center_x=BOARD_SIZE//2, center_y=BOARD_SIZE//2):
     x1, y1 = pos1
@@ -269,46 +251,106 @@ def parse_args():
         default=64,
         help="MCTS search visits for White AI."
     )
+    parser.add_argument(
+        "--early-stop",
+        action="store_true",
+        default=False,
+        help="Enable SPRT early termination when result is statistically significant."
+    )
+    parser.add_argument(
+        "--min-games",
+        type=int,
+        default=20,
+        help="Minimum number of games before SPRT early stop can trigger (default: 20)."
+    )
+    parser.add_argument(
+        "--sprt-h1",
+        type=float,
+        default=35.0,
+        help="SPRT H1 hypothesis: Elo difference to detect (default: 35)."
+    )
+    parser.add_argument(
+        "--sprt-alpha",
+        type=float,
+        default=0.05,
+        help="SPRT Type I error rate (default: 0.05)."
+    )
+    parser.add_argument(
+        "--sprt-beta",
+        type=float,
+        default=0.05,
+        help="SPRT Type II error rate (default: 0.05)."
+    )
     return parser.parse_args()
 
 def main():
     args = parse_args()
     print("=" * 60)
     print("Gomoku Headless Runner Initialized")
-    print(f"Black Model: {args.black_model or 'Default DLL Model'}")
-    print(f"White Model: {args.white_model or 'Default DLL Model'}")
+    print(f"Model A (candidate): {args.black_model or 'Default DLL Model'}")
+    print(f"Model B (baseline):  {args.white_model or 'Default DLL Model'}")
     print(f"Games: {args.games}")
     print(f"Output Report: {args.output}")
+    print(f"Early Stop: {args.early_stop}")
+    if args.early_stop:
+        print(f"  SPRT H1: {args.sprt_h1} Elo, Alpha: {args.sprt_alpha}, Beta: {args.sprt_beta}")
+        print(f"  Min Games: {args.min_games}")
     print("=" * 60)
 
     # Spin up White worker subprocess if custom white model configured
     if args.white_model:
-        _reload_white_worker_process(args.white_model)
+        white_worker_client = _start_white_worker(args.white_model)
 
     results = []
     black_wins = 0
     white_wins = 0
     active_history = []  # Precise singleton undo tracker
+    sprt_result_data = None  # SPRT result if early stop triggered
 
-    # Initialize environment
-    env = dll.GetGameEngine()
+    # Color-balanced tracking: candidate = black_model (model A)
+    candidate_black_wins = 0   # candidate wins when playing black
+    candidate_white_wins = 0   # candidate wins when playing white
+    baseline_black_wins = 0    # baseline wins when playing black
+    baseline_white_wins = 0    # baseline wins when playing white
+    last_white_model = None    # track last white model to avoid unnecessary reloads
 
     try:
         for game_idx in range(args.games):
-            print(f"\n[Game {game_idx + 1}/{args.games}] Starting...")
-            
-            # 彻底擦除单例引擎上上一局残留的所有棋子
-            if active_history:
-                print(f"  [Reset] Undoing {len(active_history)} stones from previous game...")
-                for x, y, r in reversed(active_history):
-                    dll.UndoMove(env, x, y, r)
-                active_history.clear()
+            # Release previous engine and get a fresh one for clean board state
+            if game_idx > 0:
+                dll.ReleaseEngine(env)
+            env = dll.GetGameEngine()
 
-            if args.black_model:
+            # Alternate colors: even games → candidate=black, odd games → baseline=black
+            candidate_is_black = (game_idx % 2 == 0)
+            if candidate_is_black:
+                current_black_model = args.black_model  # candidate
+                current_white_model = args.white_model  # baseline
+                print(f"\n[Game {game_idx + 1}/{args.games}] Starting... (candidate=BLACK, baseline=WHITE)")
+            else:
+                current_black_model = args.white_model  # baseline
+                current_white_model = args.black_model  # candidate
+                print(f"\n[Game {game_idx + 1}/{args.games}] Starting... (baseline=BLACK, candidate=WHITE)")
+
+            active_history.clear()
+
+            # Load black model for this game
+            if current_black_model:
                 if load_kata_model is None:
                     print("  [ERROR] LoadKataModel function not found in DLL, cannot load black model", file=sys.stderr)
                     sys.exit(1)
-                load_kata_model(env, args.black_model.encode("utf-8"), KATA_CONFIG_PATH.encode("utf-8"))
+                load_kata_model(env, current_black_model.encode("utf-8"), KATA_CONFIG_PATH.encode("utf-8"))
+
+            # Reload white worker only when model changes
+            if current_white_model and current_white_model != last_white_model:
+                if white_worker_client is not None:
+                    white_worker_client.close()
+                white_worker_client = _start_white_worker(current_white_model)
+                last_white_model = current_white_model
+
+            # Reset board state for color symmetry (both sides start clean)
+            if white_worker_client is not None:
+                white_worker_client.reset_board()
 
             history = []
             winner = None
@@ -378,7 +420,7 @@ def main():
                     # Built-in Black AI MCTS search
                     if set_kata_enabled is not None:
                         set_kata_enabled(env, True)
-                        set_kata_search_params(env, args.visits_black, 0.0, 0.6, 0.6)
+                        set_kata_search_params(env, args.visits_black, 0.0, 0.3, 0.3)
                     arr = (AIMove * 10)()
                     cnt = dll.GetTopMoves(env, BLACK, arr, 10)
                     if cnt > 0:
@@ -396,14 +438,11 @@ def main():
                         break
                 else:
                     # White AI Move
-                    if args.white_model and white_worker_process is not None:
-                        # Subprocess White Worker
-                        res = _query_white_worker_move(history, args.visits_white, 0.3, 0.3, "MCTS")
-                        if res is None:
-                            # Retry once on transient failure
-                            res = _query_white_worker_move(history, args.visits_white, 0.3, 0.3, "MCTS")
-                        if res is not None:
-                            wx, wy, wscore = res
+                    if args.white_model and white_worker_client is not None:
+                        # WorkerClient White AI
+                        resp = white_worker_client.query(history, args.visits_white, 0.3, 0.3, "MCTS", WHITE)
+                        if resp.get("status") == "ok":
+                            wx, wy, wscore = int(resp["x"]), int(resp["y"]), int(resp["score"])
                             dll.DoMove(env, wx, wy, WHITE)
                             history.append((wx, wy, WHITE))
                             active_history.append((wx, wy, WHITE))
@@ -412,8 +451,32 @@ def main():
                                 winner = WHITE
                             else:
                                 current_role = BLACK
+                        elif resp.get("error") == "WORKER_CRASHED":
+                            # Attempt to restart worker and retry once
+                            print("  [Recovery] Worker crashed, restarting...")
+                            white_worker_client.close()
+                            white_worker_client = _start_white_worker(current_white_model)
+                            if white_worker_client is not None:
+                                white_worker_client.reset_board()
+                                resp2 = white_worker_client.query(history, args.visits_white, 0.3, 0.3, "MCTS", WHITE)
+                                if resp2.get("status") == "ok":
+                                    wx, wy, wscore = int(resp2["x"]), int(resp2["y"]), int(resp2["score"])
+                                    dll.DoMove(env, wx, wy, WHITE)
+                                    history.append((wx, wy, WHITE))
+                                    active_history.append((wx, wy, WHITE))
+                                    print(f"  Step {len(history)}: WHITE (worker) places at {(wx, wy)} (score={wscore}) [recovered]")
+                                    if dll.CheckWin(env, wx, wy, WHITE):
+                                        winner = WHITE
+                                    else:
+                                        current_role = BLACK
+                                else:
+                                    print(f"  [Error] Worker still failing after restart: {resp2.get('error')}")
+                                    break
+                            else:
+                                print("  [Error] Failed to restart worker")
+                                break
                         else:
-                            print("  [Error] White worker subprocess failed to respond!")
+                            print(f"  [Error] White worker error: {resp.get('error')}")
                             break
                     else:
                         # Built-in White AI DLL MCTS search
@@ -441,44 +504,93 @@ def main():
             if winner == BLACK:
                 black_wins += 1
                 winner_str = "BLACK"
+                if candidate_is_black:
+                    candidate_black_wins += 1
+                else:
+                    baseline_black_wins += 1
             elif winner == WHITE:
                 white_wins += 1
                 winner_str = "WHITE"
+                if candidate_is_black:
+                    baseline_white_wins += 1
+                else:
+                    candidate_white_wins += 1
             else:
                 winner_str = "DRAW"
 
+            candidate_total = candidate_black_wins + candidate_white_wins
+            baseline_total = baseline_black_wins + baseline_white_wins
             print(f"[Game {game_idx + 1}] Finished! Winner: {winner_str} in {len(history)} moves")
+            print(f"  Score: candidate={candidate_total} baseline={baseline_total}")
             results.append({
                 "game_id": game_idx + 1,
                 "winner": winner_str,
+                "candidate_is_black": candidate_is_black,
                 "moves": len(history),
                 "history": [(int(x), int(y), int(r)) for x, y, r in history]
             })
 
+            # Early termination check
+            if args.early_stop and game_idx >= args.min_games - 1:
+                candidate_total = candidate_black_wins + candidate_white_wins
+                baseline_total = baseline_black_wins + baseline_white_wins
+                decision = _sprt_check(candidate_total, baseline_total,
+                                       alpha=args.sprt_alpha, beta=args.sprt_beta,
+                                       elo_diff=args.sprt_h1)
+                if decision is not None:
+                    sprt_result = compute_sprt_result(candidate_total, baseline_total,
+                                                      alpha=args.sprt_alpha, beta=args.sprt_beta,
+                                                      elo_diff=args.sprt_h1)
+                    sprt_result_data = sprt_result.to_dict() if hasattr(sprt_result, 'to_dict') else {
+                        "decision": sprt_result.decision, "winrate": sprt_result.winrate,
+                        "wins": sprt_result.wins, "losses": sprt_result.losses, "total": sprt_result.total
+                    }
+                    print(f"\n[SPRT] Early termination after {game_idx + 1} games! Decision: {decision}")
+                    print(f"  Candidate wins: {candidate_total} (as black: {candidate_black_wins}, as white: {candidate_white_wins})")
+                    print(f"  Baseline wins:  {baseline_total} (as black: {baseline_black_wins}, as white: {baseline_white_wins})")
+                    print(f"  Elo diff: {sprt_result.elo_diff:.1f} [{sprt_result.ci_lower:.1f}, {sprt_result.ci_upper:.1f}]")
+                    break
+
     finally:
         # Standard cleanups for sub-processes
-        if white_worker_process is not None:
-            try:
-                white_worker_process.stdin.write("quit\n")
-                white_worker_process.stdin.flush()
-                white_worker_process.terminate()
-                white_worker_process.wait(timeout=1.0)
-            except Exception:
-                pass
+        if white_worker_client is not None:
+            white_worker_client.close()
         dll.ReleaseEngine(env)
 
     # Save summary report
+    total_played = len(results)
+    candidate_total = candidate_black_wins + candidate_white_wins
+    baseline_total = baseline_black_wins + baseline_white_wins
     report = {
         "summary": {
-            "total_games": args.games,
+            "total_games": total_played,
             "black_wins": black_wins,
             "white_wins": white_wins,
-            "draws": args.games - (black_wins + white_wins),
-            "black_win_rate": float(black_wins) / args.games if args.games > 0 else 0,
-            "white_win_rate": float(white_wins) / args.games if args.games > 0 else 0
+            "draws": total_played - (black_wins + white_wins),
+            "candidate_wins": candidate_total,
+            "baseline_wins": baseline_total,
+            "candidate_win_rate": float(candidate_total) / total_played if total_played > 0 else 0,
+            "candidate_black_wins": candidate_black_wins,
+            "candidate_white_wins": candidate_white_wins,
+            "baseline_black_wins": baseline_black_wins,
+            "baseline_white_wins": baseline_white_wins,
         },
         "games": results
     }
+
+    # Add SPRT result if early stop was triggered
+    if sprt_result_data is not None:
+        report["sprt_result"] = sprt_result_data
+
+    # Also compute final SPRT result if early stop was enabled but didn't trigger
+    if args.early_stop and sprt_result_data is None and candidate_total + baseline_total > 0:
+        final_sprt = compute_sprt_result(candidate_total, baseline_total,
+                                         alpha=args.sprt_alpha, beta=args.sprt_beta,
+                                         elo_diff=args.sprt_h1)
+        report["sprt_result"] = final_sprt.to_dict() if hasattr(final_sprt, 'to_dict') else {
+            "decision": final_sprt.decision, "winrate": final_sprt.winrate,
+            "wins": final_sprt.wins, "losses": final_sprt.losses, "total": final_sprt.total
+        }
 
     try:
         with open(args.output, "w", encoding="utf-8") as f:

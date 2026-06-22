@@ -1,0 +1,113 @@
+{
+  "plan_name": "test02-param-fix",
+  "description": "Fix test_02 branch training parameters: reset LR, increase data volume, improve PK reliability",
+  "total_rounds": 5,
+  "model_kind": "b10c128",
+  "initial_model": "7ddbb0cc35d7",
+  "initial_branch": "test_02",
+  "promotion_threshold": 0.58,
+  "stages": [
+    {
+      "start_round": 1,
+      "end_round": 5,
+      "description": "Fixed parameters: LR=0.001, sh_samples=50000, pk_games=100, symmetric visits",
+      "config": {
+        "sf_games": 600,
+        "sf_visits": 96,
+        "sh_samples": 50000,
+        "tr_lr": 0.001,
+        "tr_batch": 64,
+        "tr_epochs": 1,
+        "pk_games": 100,
+        "pk_visits_b": 128,
+        "pk_visits_w": 128,
+        "pk_threshold": 0.58,
+        "sf_threads": 4,
+        "sh_threads": 2,
+        "tr_fp16": false,
+        "tr_pos_len": 15,
+        "tr_soft_policy_weight_scale": 8.0,
+        "tr_value_loss_scale": 0.6,
+        "tr_td_value_loss_scales": "0.6,0.6,0.6",
+        "tr_lookahead_alpha": 0.5,
+        "tr_lookahead_k": 6,
+        "tr_swa_scale": 1.0,
+        "tr_max_bucket_per_data": 8,
+        "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": true,
+        "replay_ratio": 0.2,
+        "replay_max_rounds": 5,
+        "sh_expand_window_per_row": 0.3,
+        "sh_taper_window_exponent": 0.8,
+        "sh_approx_rows_per_file": 50000,
+        "pk_sprt_h1": 35.0,
+        "pk_sprt_alpha": 0.05,
+        "pk_sprt_beta": 0.05,
+        "pk_min_games": 20,
+        "pk_regression": true,
+        "pk_regression_games": 10,
+        "pk_regression_threshold": 0.40,
+        "pk_regression_depth": 2
+      }
+    }
+  ],
+  "parameter_changes": {
+    "tr_lr": {
+      "from": 0.00022478848,
+      "to": 0.001,
+      "reason": "Reset LR to training-knowledge recommended range [0.001, 0.002]. Previous LR was below FP16 NaN threshold (0.00025)."
+    },
+    "sh_samples": {
+      "from": 1000,
+      "to": 50000,
+      "reason": "Increase from 2% to 100% of recommended minimum. 1000 rows is insufficient for effective learning."
+    },
+    "pk_games": {
+      "from": 20,
+      "to": 100,
+      "reason": "Increase from ±15% to ±8% confidence interval. 20 games produces unreliable winrate estimates."
+    },
+    "pk_visits_b": {
+      "from": 64,
+      "to": 128,
+      "reason": "Symmetric visits eliminate color bias. Previous 64/64 was already symmetric, but increasing to 128 improves evaluation quality."
+    },
+    "pk_visits_w": {
+      "from": 64,
+      "to": 128,
+      "reason": "Symmetric visits eliminate color bias. Previous 64/64 was already symmetric, but increasing to 128 improves evaluation quality."
+    },
+    "tr_batch": {
+      "from": 16,
+      "to": 64,
+      "reason": "Increase batch size for better GPU utilization. GTX 1650 Ti can safely handle batch=64 with b10c128."
+    },
+    "sf_games": {
+      "from": 50,
+      "to": 600,
+      "reason": "Increase selfplay games for more training data per round. Recommended range: 500-1500."
+    },
+    "sf_visits": {
+      "from": 64,
+      "to": 96,
+      "reason": "Increase MCTS visits for better search quality. Recommended range: 96-128."
+    },
+    "pk_threshold": {
+      "from": 0.55,
+      "to": 0.58,
+      "reason": "Higher threshold prevents marginal promotions. v4-stabilize used 0.58 successfully."
+    }
+  },
+  "expected_outcomes": {
+    "round_1": "LR reset should show immediate improvement in training stability. Expect winrate > 0.55 if model capacity exists.",
+    "round_2_3": "With proper data volume (50000 rows), model should converge faster. Monitor for plateau detection.",
+    "round_4_5": "If LR decays again, DecisionEngine will apply 0.5x multiplier. Watch for NaN at low LR.",
+    "risk": "LR=0.001 may be too high after 5 rounds of decay. If NaN occurs, DecisionEngine will auto-reduce."
+  },
+  "monitoring_checkpoints": [
+    "Check training log for NaN occurrences after each round",
+    "Verify PK is actually running (check pk_result_*.json timestamps)",
+    "Monitor winrate trend: should be > 0.55 for promotion",
+    "Check color bias: Black/White wins should be ~50/50"
+  ]
+}

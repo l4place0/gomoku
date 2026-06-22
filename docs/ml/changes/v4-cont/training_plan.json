@@ -1,0 +1,71 @@
+{
+  "plan_name": "v4-cont",
+  "total_rounds": 10,
+  "model_kind": "b10c128",
+  "initial_model": "94dc157a7f86",
+  "promotion_threshold": 0.58,
+  "stages": [
+    {
+      "start_round": 1,
+      "end_round": 5,
+      "config": {
+        "sf_games": 800,
+        "sf_visits": 128,
+        "sh_samples": 50000,
+        "tr_lr": 0.0005,
+        "tr_batch": 64,
+        "tr_epochs": 2,
+        "pk_games": 100,
+        "pk_visits_b": 128,
+        "pk_visits_w": 128,
+        "pk_threshold": 0.58,
+        "sf_threads": 4,
+        "sh_threads": 2,
+        "tr_fp16": false,
+        "tr_pos_len": 15,
+        "tr_soft_policy_weight_scale": 8.0,
+        "tr_value_loss_scale": 0.6,
+        "tr_td_value_loss_scales": "0.6,0.6,0.6",
+        "tr_lookahead_alpha": 0.5,
+        "tr_lookahead_k": 6,
+        "tr_swa_scale": 1.0,
+        "tr_max_bucket_per_data": 8,
+        "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": true,
+        "replay_ratio": 0.2,
+        "replay_max_rounds": 5
+      }
+    },
+    {
+      "start_round": 6,
+      "end_round": 10,
+      "config": {
+        "sf_games": 1000,
+        "sf_visits": 128,
+        "sh_samples": 80000,
+        "tr_lr": 0.0003,
+        "tr_batch": 64,
+        "tr_epochs": 2,
+        "pk_games": 100,
+        "pk_visits_b": 128,
+        "pk_visits_w": 128,
+        "pk_threshold": 0.58,
+        "sf_threads": 4,
+        "sh_threads": 2,
+        "tr_fp16": false,
+        "tr_pos_len": 15,
+        "tr_soft_policy_weight_scale": 8.0,
+        "tr_value_loss_scale": 0.6,
+        "tr_td_value_loss_scales": "0.6,0.6,0.6",
+        "tr_lookahead_alpha": 0.5,
+        "tr_lookahead_k": 6,
+        "tr_swa_scale": 1.0,
+        "tr_max_bucket_per_data": 8,
+        "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": true,
+        "replay_ratio": 0.2,
+        "replay_max_rounds": 5
+      }
+    }
+  ]
+}

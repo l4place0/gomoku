@@ -62,6 +62,7 @@ def model():
     return m
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available in test environment")
 def test_cuda_available():
     assert torch.cuda.is_available(), "CUDA not available — check GPU driver and PyTorch install"
 

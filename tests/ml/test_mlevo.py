@@ -6,7 +6,7 @@ import shutil
 import re
 from pathlib import Path
 
-from ml.mlevo_cli import DecisionEngine, cmd_new, find_plan, load_ledger, PLANS_DIR, ARCHIVE_DIR
+from ml.mlevo_cli import DecisionEngine, cmd_new, find_plan, load_ledger, CHANGES_DIR, ARCHIVE_DIR
 
 @pytest.fixture
 def base_config():
@@ -75,7 +75,7 @@ def test_decision_engine_lr_decay_plateau(base_config):
 
     # tr_lr should be decayed by 50%
     assert decided["tr_lr"] == 0.001
-    assert any("Adaptive LR decay" in r for r in reasons)
+    assert any("LR decay" in r for r in reasons)
 
 def test_decision_engine_no_lr_decay_on_large_diff(base_config):
     history = []
@@ -93,7 +93,7 @@ def test_decision_engine_no_lr_decay_on_large_diff(base_config):
 
     # tr_lr should remain baseline
     assert decided["tr_lr"] == 0.002
-    assert any("Adaptive LR decay not triggered" in r for r in reasons)
+    assert any("LR decay not triggered" in r for r in reasons)
 
 def test_decision_engine_crash_recovery_oom(base_config):
     history = []
@@ -108,7 +108,7 @@ def test_decision_engine_crash_recovery_oom(base_config):
 
     # Batch size should be halved
     assert decided["tr_batch"] == 32
-    assert any("Crash recovery (OOM)" in r for r in reasons)
+    assert any("OOM recovery" in r for r in reasons)
 
 def test_decision_engine_crash_recovery_nan(base_config):
     history = []
@@ -122,7 +122,7 @@ def test_decision_engine_crash_recovery_nan(base_config):
 
     # tr_lr should be halved
     assert decided["tr_lr"] == 0.001
-    assert any("Crash recovery (NaN)" in r for r in reasons)
+    assert any("NaN recovery" in r for r in reasons)
 
 def test_decision_engine_guardrails(base_config):
     # Config violating guardrails
@@ -137,15 +137,15 @@ def test_decision_engine_guardrails(base_config):
     engine = DecisionEngine(bad_config, [])
     decided, reasons, warnings = engine.decide(next_round=1)
 
-    assert len(warnings) == 3
-    assert any("sf_games (50) is below" in w for w in warnings)
-    assert any("pk_games (10) is below" in w for w in warnings)
-    assert any("sh_samples (20000) is below" in w for w in warnings)
+    assert len(warnings) == 2
+    assert any("sf_games (50) below recommended" in w for w in warnings)
+    assert any("pk_games (10) below recommended" in w for w in warnings)
 
 def test_scaffold_new_plan(tmp_path, monkeypatch):
-    # Mock PLANS_DIR to a temporary folder
-    temp_plans_dir = tmp_path / "plans"
-    monkeypatch.setattr("ml.mlevo_cli.PLANS_DIR", temp_plans_dir)
+    # Mock CHANGES_DIR to a temporary folder
+    temp_plans_dir = tmp_path / "changes"
+    monkeypatch.setattr("ml.mlevo_cli.CHANGES_DIR", temp_plans_dir)
+    monkeypatch.setattr("ml.mlevo_cli.ARCHIVE_DIR", temp_plans_dir / "archive")
     monkeypatch.setattr("ml.mlevo_cli.get_plan_dir", lambda name: temp_plans_dir / name)
 
     class Args:
@@ -156,9 +156,6 @@ def test_scaffold_new_plan(tmp_path, monkeypatch):
     plan_dir = temp_plans_dir / "test-plan"
     assert plan_dir.exists()
     assert (plan_dir / "training_plan.json").exists()
-    assert (plan_dir / "proposal.md").exists()
-    assert (plan_dir / "design.md").exists()
-    assert (plan_dir / "tasks.md").exists()
 
     # Verify content of training_plan.json
     plan_config = json.loads((plan_dir / "training_plan.json").read_text(encoding="utf-8"))

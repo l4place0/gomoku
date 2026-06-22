@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 ML_DIR = Path(__file__).resolve().parent.parent
@@ -196,3 +197,62 @@ def get_plans():
 @app.get("/api/plans/{plan_name}")
 def get_plan_detail(plan_name: str):
     return _run_cli("plan", "--name", plan_name)
+
+
+@app.get("/api/changes/{plan_name}/markdown/{filename}")
+def get_change_markdown(plan_name: str, filename: str):
+    """Retrieve active or archived proposal/design/conclusion markdown files."""
+    if filename not in ("proposal.md", "design.md", "conclusion.md", "tasks.md"):
+        raise HTTPException(status_code=400, detail="Invalid filename requested")
+    
+    # 1. Search in active changes: docs/ml/changes/{plan_name}/{filename}
+    active_path = ML_DIR.parent / "docs" / "ml" / "changes" / plan_name / filename
+    if active_path.exists() and active_path.is_file():
+        try:
+            return {"content": _read_log_file(active_path)}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
+            
+    # 2. Search in archived changes: docs/ml/changes/archive/*-{plan_name}/{filename}
+    archive_dir = ML_DIR.parent / "docs" / "ml" / "changes" / "archive"
+    if archive_dir.exists() and archive_dir.is_dir():
+        for p in archive_dir.glob(f"*-{plan_name}"):
+            if p.is_dir():
+                target_path = p / filename
+                if target_path.exists() and target_path.is_file():
+                    try:
+                        return {"content": _read_log_file(target_path)}
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
+        for p in archive_dir.glob(plan_name):
+            if p.is_dir():
+                target_path = p / filename
+                if target_path.exists() and target_path.is_file():
+                    try:
+                        return {"content": _read_log_file(target_path)}
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"Failed to read file: {e}")
+
+    raise HTTPException(status_code=404, detail="Markdown file not found")
+
+
+@app.get("/{catchall:path}")
+def serve_spa(catchall: str):
+    """Serve React SPA frontend static files or index.html for React Router."""
+    if catchall.startswith("api/"):
+        raise HTTPException(status_code=404, detail="API endpoint not found")
+
+    dist_dir = ML_DIR.parent / "webui" / "frontend" / "dist"
+    
+    # Try serving static asset directly
+    file_path = dist_dir / catchall
+    if file_path.exists() and file_path.is_file():
+        return FileResponse(file_path)
+        
+    # Serve index.html as fallback for React Router path refreshes
+    index_path = dist_dir / "index.html"
+    if index_path.exists() and index_path.is_file():
+        return FileResponse(index_path)
+        
+    raise HTTPException(status_code=404, detail="Static files not found. Run npm run build first.")
+

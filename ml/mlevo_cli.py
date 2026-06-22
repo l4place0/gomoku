@@ -21,9 +21,11 @@ from datetime import datetime, timezone
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 LOG_DIR = BASE_DIR / "data" / "logs"
-PLANS_DIR = PROJECT_ROOT / "docs" / "ml" / "plans"
-ARCHIVE_DIR = PLANS_DIR / "archive"
+PLANS_DIR = PROJECT_ROOT / "docs" / "ml" / "plans"  # legacy, runtime data only
+CHANGES_DIR = PROJECT_ROOT / "docs" / "ml" / "changes"
+ARCHIVE_DIR = CHANGES_DIR / "archive"
 LEDGER_PATH = LOG_DIR / "evolution_ledger.json"
 STATE_PATH = LOG_DIR / "pipeline_state.json"
 PROGRESS_PATH = LOG_DIR / "progress.json"
@@ -37,10 +39,14 @@ PRESETS = {
     "tiny": {
         "sf_games": 5, "sf_visits": 8, "sh_samples": 100,
         "tr_epochs": 1, "pk_games": 4, "tr_batch": 16,
+        "tr_max_bucket_per_data": 8, "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": True,
     },
     "small": {
         "sf_games": 50, "sf_visits": 32, "sh_samples": 1000,
         "tr_epochs": 1, "pk_games": 10, "tr_batch": 32,
+        "tr_max_bucket_per_data": 8, "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": True,
     },
 }
 
@@ -144,19 +150,65 @@ def _get_dag():
 
 # --- Decision Engine (preserved from original) ---
 
+# Recommended default strategy for DecisionEngine
+DEFAULT_STRATEGY = {
+    # Entropy boost on failure
+    "entropy_boost_games_mult": 1.2,      # sf_games multiplier on failure
+    "entropy_boost_visits_add": 16,       # sf_visits addition on failure
+    # LR plateau detection
+    "plateau_loss_threshold": 0.05,       # loss diff below this = plateau
+    "plateau_lr_decay": 0.5,              # lr multiplier on plateau
+    # LR decay on consecutive failures
+    "failure_decay_threshold": 2,         # consecutive failures to trigger decay
+    "failure_lr_decay": 0.7,              # lr multiplier on consecutive failures
+    # LR floor
+    "lr_floor": 0.0001,                   # minimum lr
+    # OOM recovery
+    "oom_batch_min": 16,                  # minimum batch size
+    "oom_batch_decay": 0.5,               # batch multiplier on OOM
+    # NaN recovery
+    "nan_lr_decay": 0.5,                  # lr multiplier on NaN
+    # Validation thresholds (for warnings)
+    "min_sf_games_warn": 100,
+    "min_pk_games_warn": 20,
+}
+
+
 class DecisionEngine:
-    def __init__(self, baseline_config, history, log_contents=None):
+    def __init__(self, baseline_config, history, log_contents=None, strategy=None):
         self.baseline = baseline_config
         self.history = history
         self.log_contents = log_contents or {}
+        self.strategy = {**DEFAULT_STRATEGY, **(strategy or {})}
+
+    def _get_last_lr(self, round_no):
+        """Get the actual lr used in the specified round from history."""
+        for record in reversed(self.history):
+            if record.get("round") == round_no:
+                return record.get("params", {}).get("tr_lr")
+        return None
+
+    def _count_consecutive_failures(self, from_round):
+        """Count consecutive failures starting from from_round going backwards."""
+        count = 0
+        for record in reversed(self.history):
+            if record.get("round") <= from_round:
+                pk_info = record.get("pk", {})
+                if not pk_info.get("promoted", False):
+                    count += 1
+                else:
+                    break
+        return count
 
     def decide(self, next_round):
+        s = self.strategy
         decided = self.baseline.copy()
         reasons = []
         warnings = []
 
         prev_round = next_round - 1
         prev_round_failed = False
+        prev_round_promoted = False
         prev_round_record = None
 
         if self.history:
@@ -167,12 +219,13 @@ class DecisionEngine:
 
         if prev_round_record:
             pk_info = prev_round_record.get("pk", {})
-            if not pk_info.get("promoted", False):
+            prev_round_promoted = pk_info.get("promoted", False)
+            if not prev_round_promoted:
                 prev_round_failed = True
 
         if prev_round_failed:
-            decided["sf_games"] = int(round(self.baseline.get("sf_games", 500) * 1.2))
-            decided["sf_visits"] = self.baseline.get("sf_visits", 96) + 16
+            decided["sf_games"] = int(round(self.baseline.get("sf_games", 500) * s["entropy_boost_games_mult"]))
+            decided["sf_visits"] = self.baseline.get("sf_visits", 96) + s["entropy_boost_visits_add"]
             reasons.append(f"Entropy boost: sf_games={decided['sf_games']}, sf_visits={decided['sf_visits']}")
         else:
             reasons.append("Entropy boost not triggered")
@@ -186,34 +239,223 @@ class DecisionEngine:
                 except Exception:
                     pass
 
+        # --- LR scheduling with memory ---
+        # Start from the previous round's actual lr, not the baseline
+        last_lr = self._get_last_lr(prev_round)
+        base_lr = last_lr if last_lr is not None else self.baseline.get("tr_lr", 0.002)
+
         lr_decay_triggered = False
         if log_text:
             losses = [float(x) for x in re.findall(r"loss\s*=\s*(\d+\.\d+)", log_text)]
             if len(losses) >= 2:
                 diff = abs(losses[-1] - losses[0])
-                if diff < 0.05:
-                    decided["tr_lr"] = max(0.0001, self.baseline.get("tr_lr", 0.002) * 0.5)
+                if diff < s["plateau_loss_threshold"]:
+                    decided["tr_lr"] = max(s["lr_floor"], base_lr * s["plateau_lr_decay"])
                     lr_decay_triggered = True
                     reasons.append(f"LR decay: tr_lr={decided['tr_lr']} (plateau detected)")
 
         if not lr_decay_triggered:
-            reasons.append("LR decay not triggered")
+            if prev_round_promoted:
+                # Lock lr on success — don't go back up
+                decided["tr_lr"] = base_lr
+                reasons.append(f"LR locked: tr_lr={decided['tr_lr']} (previous round promoted)")
+            else:
+                # On consecutive failures, decay lr
+                consecutive_failures = self._count_consecutive_failures(prev_round)
+                if consecutive_failures >= s["failure_decay_threshold"]:
+                    decided["tr_lr"] = max(s["lr_floor"], base_lr * s["failure_lr_decay"])
+                    reasons.append(f"LR decay: tr_lr={decided['tr_lr']} ({consecutive_failures} consecutive failures)")
+                else:
+                    decided["tr_lr"] = base_lr
+                    reasons.append("LR decay not triggered")
 
         if log_text:
             if "OutOfMemoryError" in log_text or "CUDA out of memory" in log_text:
-                decided["tr_batch"] = max(16, self.baseline.get("tr_batch", 64) // 2)
+                decided["tr_batch"] = max(s["oom_batch_min"], int(self.baseline.get("tr_batch", 64) * s["oom_batch_decay"]))
                 reasons.append(f"OOM recovery: tr_batch={decided['tr_batch']}")
             if "nan" in log_text.lower():
-                decided["tr_lr"] = max(0.0001, self.baseline.get("tr_lr", 0.002) * 0.5)
+                decided["tr_lr"] = max(s["lr_floor"], decided.get("tr_lr", 0.002) * s["nan_lr_decay"])
                 reasons.append(f"NaN recovery: tr_lr={decided['tr_lr']}")
                 warnings.append("Previous round had NaN loss — checkpoint was purged, will reinitialize from scratch")
 
-        if decided.get("sf_games", 0) < 100:
-            warnings.append(f"sf_games ({decided['sf_games']}) below recommended 100")
-        if decided.get("pk_games", 0) < 20:
-            warnings.append(f"pk_games ({decided['pk_games']}) below recommended 20")
+        if decided.get("sf_games", 0) < s["min_sf_games_warn"]:
+            warnings.append(f"sf_games ({decided['sf_games']}) below recommended {s['min_sf_games_warn']}")
+        if decided.get("pk_games", 0) < s["min_pk_games_warn"]:
+            warnings.append(f"pk_games ({decided['pk_games']}) below recommended {s['min_pk_games_warn']}")
+
+        # --- Regression response ---
+        regressions = s.get("regression_detected", [])
+        if regressions:
+            high_severity = [r for r in regressions if r.get("severity") == "high"]
+            if high_severity:
+                decided["tr_lr"] = max(s.get("lr_floor", 0.0001),
+                                       decided.get("tr_lr", 0.002) * s.get("regression_lr_decay", 0.8))
+                reasons.append(f"Regression response: LR decay to {decided['tr_lr']} (high severity)")
+                warnings.append(f"High severity regression detected: {high_severity[0]['type']}")
+            else:
+                boost = s.get("regression_entropy_boost", 1.2)
+                decided["sf_games"] = int(round(decided.get("sf_games", 500) * boost))
+                reasons.append(f"Regression response: sf_games boost to {decided['sf_games']} (medium severity)")
 
         return decided, reasons, warnings
+
+
+DEFAULT_REGRESSION_STRATEGY = {
+    "sudden_drop_threshold": 0.15,    # Single-round winrate drop threshold
+    "trend_decline_window": 3,        # Consecutive declining rounds to trigger
+    "ancestor_regression_margin": 0.10,  # How much worse than ancestor average
+    "regression_lr_decay": 0.8,       # Extra LR multiplier on regression
+    "regression_entropy_boost": 1.2,  # sf_games multiplier on regression
+    "elo_drop_threshold": 50,         # Elo drop threshold for high severity
+    "elo_trend_decline_window": 3,    # Consecutive declining Elo rounds
+}
+
+
+class RegressionDetector:
+    """Detects performance regressions in training history."""
+
+    def __init__(self, history, strategy=None):
+        self.history = history
+        self.strategy = {**DEFAULT_REGRESSION_STRATEGY, **(strategy or {})}
+
+    def _get_winrates(self):
+        """Extract (round, winrate) pairs from history for promoted models."""
+        pairs = []
+        for record in self.history:
+            pk = record.get("pk", {})
+            wr = pk.get("winrate")
+            if wr is not None:
+                pairs.append((record.get("round", 0), wr))
+        pairs.sort(key=lambda x: x[0])
+        return pairs
+
+    def detect_sudden_drop(self):
+        """Detect single-round winrate drop exceeding threshold."""
+        pairs = self._get_winrates()
+        if len(pairs) < 2:
+            return []
+        threshold = self.strategy["sudden_drop_threshold"]
+        regressions = []
+        for i in range(1, len(pairs)):
+            drop = pairs[i - 1][1] - pairs[i][1]
+            if drop > threshold:
+                regressions.append({
+                    "type": "sudden_drop",
+                    "severity": "high",
+                    "round": pairs[i][0],
+                    "winrate": pairs[i][1],
+                    "prev_winrate": pairs[i - 1][1],
+                    "drop": round(drop, 4),
+                })
+        return regressions
+
+    def detect_trend_decline(self):
+        """Detect consecutive winrate decline over a window."""
+        pairs = self._get_winrates()
+        window = self.strategy["trend_decline_window"]
+        if len(pairs) < window:
+            return []
+        regressions = []
+        # Check the last `window` entries for monotonically declining winrate
+        recent = pairs[-window:]
+        declining = all(recent[i][1] > recent[i + 1][1] for i in range(len(recent) - 1))
+        if declining:
+            total_drop = recent[0][1] - recent[-1][1]
+            regressions.append({
+                "type": "trend_decline",
+                "severity": "medium",
+                "window": window,
+                "start_round": recent[0][0],
+                "end_round": recent[-1][0],
+                "start_winrate": recent[0][1],
+                "end_winrate": recent[-1][1],
+                "total_drop": round(total_drop, 4),
+            })
+        return regressions
+
+    def detect_ancestor_regression(self):
+        """Detect if current winrate is significantly below ancestor average."""
+        pairs = self._get_winrates()
+        if len(pairs) < 3:
+            return []
+        margin = self.strategy["ancestor_regression_margin"]
+        current_wr = pairs[-1][1]
+        ancestor_wrs = [wr for _, wr in pairs[:-1]]
+        avg_ancestor = sum(ancestor_wrs) / len(ancestor_wrs)
+        regressions = []
+        if current_wr < avg_ancestor - margin:
+            regressions.append({
+                "type": "ancestor_regression",
+                "severity": "medium",
+                "current_winrate": current_wr,
+                "ancestor_avg_winrate": round(avg_ancestor, 4),
+                "gap": round(avg_ancestor - current_wr, 4),
+            })
+        return regressions
+
+    def _get_elo_diffs(self):
+        """Extract (round, elo_diff) pairs from history."""
+        pairs = []
+        for record in self.history:
+            pk = record.get("pk", {})
+            ed = pk.get("elo_diff")
+            if ed is not None:
+                pairs.append((record.get("round", 0), ed))
+        pairs.sort(key=lambda x: x[0])
+        return pairs
+
+    def detect_elo_drop(self):
+        """Detect single-round Elo drop exceeding threshold."""
+        pairs = self._get_elo_diffs()
+        if len(pairs) < 2:
+            return []
+        threshold = self.strategy["elo_drop_threshold"]
+        regressions = []
+        for i in range(1, len(pairs)):
+            drop = pairs[i - 1][1] - pairs[i][1]
+            if drop > threshold:
+                regressions.append({
+                    "type": "elo_drop",
+                    "severity": "high",
+                    "round": pairs[i][0],
+                    "elo_diff": pairs[i][1],
+                    "prev_elo_diff": pairs[i - 1][1],
+                    "drop": round(drop, 1),
+                })
+        return regressions
+
+    def detect_elo_trend_decline(self):
+        """Detect consecutive Elo decline over a window."""
+        pairs = self._get_elo_diffs()
+        window = self.strategy["elo_trend_decline_window"]
+        if len(pairs) < window:
+            return []
+        recent = pairs[-window:]
+        declining = all(recent[i][1] > recent[i + 1][1] for i in range(len(recent) - 1))
+        regressions = []
+        if declining:
+            total_drop = recent[0][1] - recent[-1][1]
+            regressions.append({
+                "type": "elo_trend_decline",
+                "severity": "medium",
+                "window": window,
+                "start_round": recent[0][0],
+                "end_round": recent[-1][0],
+                "start_elo": recent[0][1],
+                "end_elo": recent[-1][1],
+                "total_drop": round(total_drop, 1),
+            })
+        return regressions
+
+    def detect(self):
+        """Run all detection methods and return combined results."""
+        results = []
+        results += self.detect_sudden_drop()
+        results += self.detect_trend_decline()
+        results += self.detect_ancestor_regression()
+        results += self.detect_elo_drop()
+        results += self.detect_elo_trend_decline()
+        return results
 
 
 # --- Ledger ---
@@ -229,7 +471,7 @@ def save_ledger(ledger):
 # --- Plan helpers ---
 
 def get_plan_dir(plan_name):
-    return PLANS_DIR / plan_name
+    return CHANGES_DIR / plan_name
 
 
 def find_plan(plan_name=None):
@@ -239,8 +481,8 @@ def find_plan(plan_name=None):
             return plan_name, plan_dir
         _error(f"Plan '{plan_name}' not found")
     active_plans = []
-    if PLANS_DIR.exists():
-        for item in PLANS_DIR.iterdir():
+    if CHANGES_DIR.exists():
+        for item in CHANGES_DIR.iterdir():
             if item.is_dir() and item.name != "archive":
                 active_plans.append(item)
     if len(active_plans) == 1:
@@ -374,13 +616,29 @@ def cmd_run(args):
         if not stage_config:
             stages = plan_config.get("stages", [])
             stage_config = stages[0].get("config", {}) if stages else {}
-        engine = DecisionEngine(stage_config, history)
+        # Merge plan strategy with CLI override
+        strategy = plan_config.get("strategy", {})
+        cli_strategy = getattr(args, 'strategy', None)
+        if cli_strategy:
+            try:
+                strategy = {**strategy, **json.loads(cli_strategy)}
+            except json.JSONDecodeError:
+                _error(f"Invalid --strategy JSON: {cli_strategy}")
+        # Regression detection before DecisionEngine
+        detector = RegressionDetector(history, strategy=strategy)
+        regressions = detector.detect()
+        if regressions:
+            strategy["regression_detected"] = regressions
+            for r in regressions:
+                print(f"  [Regression] {r['type']}: severity={r['severity']}", flush=True)
+        engine = DecisionEngine(stage_config, history, strategy=strategy)
         decided_params, _, _ = engine.decide(round_no)
-        decided_params["round"] = round_no
-        decided_params["model_name"] = plan_config.get("model_kind", "b10c128")
-        decided_params["tr_kind"] = plan_config.get("model_kind", "b10c128")
-        decided_params["pk_threshold"] = plan_config.get("promotion_threshold", 0.55)
-        params = decided_params
+        # Merge stage_config as base, then overlay decided params
+        params = {**stage_config, **decided_params}
+        params["round"] = round_no
+        params["model_name"] = plan_config.get("model_kind", "b10c128")
+        params["tr_kind"] = plan_config.get("model_kind", "b10c128")
+        params["pk_threshold"] = plan_config.get("promotion_threshold", 0.55)
     else:
         params = PRESETS.get(preset, PRESETS["tiny"]).copy()
         params["round"] = round_no
@@ -436,7 +694,7 @@ def cmd_run(args):
     save_progress("selfplay", 0, None)
 
     try:
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore", bufsize=1)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="ignore", bufsize=1, cwd=str(BASE_DIR))
         for line in process.stdout:
             print(line, end="", flush=True)
         process.wait()
@@ -576,13 +834,14 @@ def cmd_pk(args):
         "--games", str(games),
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, cwd=str(BASE_DIR))
         # Parse result from stdout
-        pk_result = {"winner": branch_a, "winrate": 0.5, "games_played": games}
+        pk_result = {"winner": branch_a, "winrate": 0.5, "games_played": games, "status": "parse_error"}
         try:
             pk_result = json.loads(result.stdout.strip().split("\n")[-1])
+            pk_result["status"] = "ok"
         except (json.JSONDecodeError, IndexError):
-            pass
+            print(f"[Warning] Failed to parse PK stdout, using default winrate=0.5", file=sys.stderr)
         _output(pk_result, True)
     except Exception as e:
         _output({"error": str(e)}, True)
@@ -627,6 +886,15 @@ def cmd_history(args):
     dag = _get_dag()
     history = dag.get_history(args.model)
     _output({"model": args.model, "lineage": history}, True)
+
+
+def cmd_lr_history(args):
+    """Get lr history for a branch."""
+    registry = _get_registry()
+    branch = getattr(args, 'branch', 'mainline')
+    last_n = getattr(args, 'last', 10)
+    lr_data = registry.get_lr_history(branch, last_n)
+    _output({"branch": branch, "lr_history": lr_data}, True)
 
 
 def cmd_recover(args):
@@ -757,6 +1025,28 @@ def cmd_test(args):
     _output(results, True)
 
 
+def cmd_show_strategy(args):
+    """Show default DecisionEngine strategy with descriptions."""
+    _output({
+        "default_strategy": DEFAULT_STRATEGY,
+        "descriptions": {
+            "entropy_boost_games_mult": "sf_games multiplier on failure (e.g. 1.2 = +20% games)",
+            "entropy_boost_visits_add": "sf_visits addition on failure",
+            "plateau_loss_threshold": "loss diff below this = plateau detected",
+            "plateau_lr_decay": "lr multiplier when plateau detected",
+            "failure_decay_threshold": "consecutive failures to trigger lr decay",
+            "failure_lr_decay": "lr multiplier on consecutive failures",
+            "lr_floor": "minimum lr (never decays below this)",
+            "oom_batch_min": "minimum batch size after OOM",
+            "oom_batch_decay": "batch multiplier on OOM recovery",
+            "nan_lr_decay": "lr multiplier on NaN loss",
+            "min_sf_games_warn": "warn if sf_games below this",
+            "min_pk_games_warn": "warn if pk_games below this",
+        },
+        "usage": "Pass --strategy '{\"failure_lr_decay\": 0.8}' to mlevo run, or add \"strategy\": {...} to training_plan.json"
+    }, True)
+
+
 def cmd_decide(args):
     """Compute next round parameters."""
     plan_name, plan_dir = find_plan(getattr(args, 'plan', None))
@@ -784,7 +1074,13 @@ def cmd_decide(args):
         stage_config = stages[0].get("config", {}) if stages else {}
 
     history = load_ledger()
-    engine = DecisionEngine(stage_config, history)
+    strategy = plan_config.get("strategy", {})
+    # Regression detection before DecisionEngine
+    detector = RegressionDetector(history, strategy=strategy)
+    regressions = detector.detect()
+    if regressions:
+        strategy["regression_detected"] = regressions
+    engine = DecisionEngine(stage_config, history, strategy=strategy)
     decided_params, reasons, warnings = engine.decide(next_round)
     decided_params["round"] = next_round
     decided_params["model_name"] = plan_config.get("model_kind", "b10c128")
@@ -802,7 +1098,7 @@ def cmd_decide(args):
 
 
 def cmd_new(args):
-    """Scaffold a new evolution plan."""
+    """Scaffold a new evolution plan under docs/ml/changes/."""
     plan_name = args.name
     plan_dir = get_plan_dir(plan_name)
     if plan_dir.exists():
@@ -826,12 +1122,235 @@ def cmd_new(args):
 def cmd_list(args):
     """List active and archived plans."""
     active = []
-    if PLANS_DIR.exists():
-        active = [d.name for d in PLANS_DIR.iterdir() if d.is_dir() and d.name != "archive"]
+    if CHANGES_DIR.exists():
+        active = [d.name for d in CHANGES_DIR.iterdir() if d.is_dir() and d.name != "archive"]
     archived = []
     if ARCHIVE_DIR.exists():
         archived = [d.name for d in ARCHIVE_DIR.iterdir() if d.is_dir()]
     _output({"active": active, "archived": archived}, True)
+
+
+def _parse_pk_log(log_path):
+    """Parse a round_*_pk.log file to extract game results and anomalies."""
+    result = {
+        "log_file": log_path.name,
+        "planned_games": 0,
+        "completed_games": 0,
+        "results": {"BLACK": 0, "WHITE": 0, "DRAW": 0},
+        "ipc_failures": 0,
+        "vcf_errors": 0,
+        "color_distribution": {"BLACK_win_pct": 0.0, "WHITE_win_pct": 0.0, "DRAW_pct": 0.0},
+        "verdict": "VALID",
+    }
+    if not log_path.exists():
+        result["verdict"] = "MISSING"
+        return result
+
+    text = log_path.read_text(errors="replace")
+
+    # Extract planned games from [Game N/M] pattern
+    planned_match = re.findall(r'\[Game \d+/(\d+)\]', text)
+    if planned_match:
+        result["planned_games"] = max(int(m) for m in planned_match)
+
+    # Count finished games and extract winners
+    finished = re.findall(r'Finished! Winner: (\w+)', text)
+    result["completed_games"] = len(finished)
+    for w in finished:
+        w_upper = w.upper()
+        if w_upper in result["results"]:
+            result["results"][w_upper] += 1
+
+    # Color distribution
+    total = result["completed_games"]
+    if total > 0:
+        result["color_distribution"]["BLACK_win_pct"] = round(result["results"]["BLACK"] / total * 100, 1)
+        result["color_distribution"]["WHITE_win_pct"] = round(result["results"]["WHITE"] / total * 100, 1)
+        result["color_distribution"]["DRAW_pct"] = round(result["results"]["DRAW"] / total * 100, 1)
+
+    # Anomalies
+    result["ipc_failures"] = text.count("IPC failed")
+    result["vcf_errors"] = text.count("zob_board not init")
+
+    # Verdict
+    if result["ipc_failures"] > 0:
+        result["verdict"] = "INVALID"
+    elif result["planned_games"] > 0 and result["completed_games"] < result["planned_games"] * 0.5:
+        result["verdict"] = "INVALID"
+    elif total > 0:
+        max_win_pct = max(result["color_distribution"]["BLACK_win_pct"], result["color_distribution"]["WHITE_win_pct"])
+        if max_win_pct > 70:
+            result["verdict"] = "DEGRADED"
+        elif result["planned_games"] > 0 and result["completed_games"] < result["planned_games"] * 0.8:
+            result["verdict"] = "DEGRADED"
+
+    return result
+
+
+def _parse_train_log(log_path):
+    """Parse a round_*_train.log file to extract training metrics."""
+    result = {"log_file": log_path.name, "vloss": None, "pacc1": None, "p0loss": None}
+    if not log_path.exists():
+        return {"log_file": log_path.name, "vloss": "MISSING", "pacc1": "MISSING", "p0loss": "MISSING"}
+
+    text = log_path.read_text(errors="replace")
+
+    # Find the last validation metrics line (contains p0loss, vloss, pacc1)
+    # Format: p0loss = 1.856951, ... vloss = 0.941201, ... pacc1 = 0.438301
+    val_lines = [line for line in text.split('\n') if 'p0loss' in line and 'vloss' in line and 'pacc1' in line]
+    if val_lines:
+        last_line = val_lines[-1]
+        p0loss_m = re.search(r'p0loss\s*=\s*([\d.]+)', last_line)
+        vloss_m = re.search(r'vloss\s*=\s*([\d.]+)', last_line)
+        pacc1_m = re.search(r'pacc1\s*=\s*([\d.]+)', last_line)
+        if p0loss_m:
+            result["p0loss"] = float(p0loss_m.group(1))
+        if vloss_m:
+            result["vloss"] = float(vloss_m.group(1))
+        if pacc1_m:
+            result["pacc1"] = round(float(pacc1_m.group(1)) * 100, 1)
+
+    return result
+
+
+def _read_ledger():
+    """Read evolution_ledger.json and return entries grouped by round."""
+    if not LEDGER_PATH.exists():
+        return []
+    try:
+        text = LEDGER_PATH.read_text()
+        entries = json.loads(text)
+        return entries if isinstance(entries, list) else []
+    except Exception:
+        return []
+
+
+def _check_ledger_consistency(pk_result, ledger_entry):
+    """Compare PK log results against ledger entry."""
+    if not ledger_entry:
+        return {"match": False, "detail": "No ledger entry found"}
+    log_wins = pk_result["results"]["BLACK"] + pk_result["results"]["WHITE"]
+    log_total = pk_result["completed_games"]
+    ledger_wins = ledger_entry.get("wins_new", 0)
+    ledger_losses = ledger_entry.get("losses_new", 0)
+    ledger_total = ledger_wins + ledger_losses
+    # Check if ledger says 0/0 but log has actual results
+    if ledger_wins == 0 and ledger_losses == 0 and log_total > 0:
+        return {"match": False, "detail": f"Ledger says 0/0 but log shows {log_total} games completed"}
+    # Check if totals roughly match (allow some tolerance for different log runs)
+    if ledger_total > 0 and log_total > 0 and abs(ledger_total - log_total) > max(5, log_total * 0.3):
+        return {"match": False, "detail": f"Ledger has {ledger_total} games but log has {log_total}"}
+    return {"match": True, "detail": ""}
+
+
+def cmd_report(args):
+    """Generate a structured fact report from training logs and ledger."""
+    plan_name = args.name
+    # Try active plans first, then archived
+    plan_dir = None
+    active_dir = CHANGES_DIR / plan_name
+    if active_dir.exists() and active_dir.is_dir():
+        plan_dir = active_dir
+    else:
+        # Search archive
+        if ARCHIVE_DIR.exists():
+            for item in ARCHIVE_DIR.iterdir():
+                if item.is_dir() and plan_name in item.name:
+                    plan_dir = item
+                    break
+    if not plan_dir:
+        _error(f"Plan '{plan_name}' not found in active or archived plans")
+
+    # Read plan metadata
+    plan_json_path = plan_dir / "training_plan.json"
+    plan_meta = {}
+    if plan_json_path.exists():
+        try:
+            plan_meta = json.loads(plan_json_path.read_text())
+        except Exception:
+            pass
+
+    model_kind = plan_meta.get("model_kind", "unknown")
+
+    # Discover PK and train logs
+    pk_logs = sorted(LOG_DIR.glob("round_*_pk.log"), key=lambda p: int(re.search(r'round_(\d+)', p.name).group(1)) if re.search(r'round_(\d+)', p.name) else 0)
+    train_logs = sorted(LOG_DIR.glob("round_*_train.log"), key=lambda p: int(re.search(r'round_(\d+)', p.name).group(1)) if re.search(r'round_(\d+)', p.name) else 0)
+
+    # Read ledger
+    ledger_entries = _read_ledger()
+
+    # Build per-round data
+    rounds = []
+    anomalies = []
+
+    # Group ledger entries by round for this plan's model_kind
+    ledger_by_round = {}
+    for entry in ledger_entries:
+        entry_kind = entry.get("params", {}).get("model_name", entry.get("params", {}).get("tr_kind", ""))
+        if entry_kind == model_kind or model_kind == "unknown":
+            r = entry.get("round")
+            if r is not None:
+                ledger_by_round[r] = entry
+
+    # Parse all PK logs
+    pk_by_round = {}
+    for log_path in pk_logs:
+        m = re.search(r'round_(\d+)', log_path.name)
+        if m:
+            round_num = int(m.group(1))
+            parsed = _parse_pk_log(log_path)
+            pk_by_round[round_num] = parsed
+
+    # Parse all train logs
+    train_by_round = {}
+    for log_path in train_logs:
+        m = re.search(r'round_(\d+)', log_path.name)
+        if m:
+            round_num = int(m.group(1))
+            parsed = _parse_train_log(log_path)
+            train_by_round[round_num] = parsed
+
+    # Combine into rounds
+    all_rounds = sorted(set(list(pk_by_round.keys()) + list(train_by_round.keys()) + list(ledger_by_round.keys())))
+    for round_num in all_rounds:
+        pk = pk_by_round.get(round_num, {"verdict": "MISSING", "planned_games": 0, "completed_games": 0, "results": {"BLACK": 0, "WHITE": 0, "DRAW": 0}, "ipc_failures": 0, "vcf_errors": 0, "color_distribution": {}})
+        train = train_by_round.get(round_num, {"vloss": "MISSING", "pacc1": "MISSING", "p0loss": "MISSING"})
+        ledger = ledger_by_round.get(round_num)
+        ledger_check = _check_ledger_consistency(pk, ledger) if pk["verdict"] != "MISSING" else {"match": True, "detail": ""}
+
+        round_data = {
+            "round": round_num,
+            "training": train,
+            "pk": pk,
+            "ledger": {
+                "wins_new": ledger.get("wins_new") if ledger else None,
+                "losses_new": ledger.get("losses_new") if ledger else None,
+                "winrate": ledger.get("winrate") if ledger else None,
+                "promoted": ledger.get("promoted") if ledger else None,
+            } if ledger else None,
+            "ledger_match": ledger_check["match"],
+            "mismatch_detail": ledger_check["detail"],
+        }
+        rounds.append(round_data)
+
+        # Collect anomalies
+        if pk.get("ipc_failures", 0) > 0:
+            anomalies.append(f"R{round_num}: IPC failures {pk['ipc_failures']}x")
+        if pk.get("vcf_errors", 0) > 0:
+            anomalies.append(f"R{round_num}: VCF solver errors {pk['vcf_errors']}x")
+        if pk.get("verdict") == "INVALID":
+            anomalies.append(f"R{round_num}: PK INVALID (completed {pk['completed_games']}/{pk['planned_games']})")
+        if not ledger_check["match"]:
+            anomalies.append(f"R{round_num}: Ledger mismatch — {ledger_check['detail']}")
+
+    report = {
+        "plan_name": plan_name,
+        "model_kind": model_kind,
+        "plan_dir": str(plan_dir),
+        "rounds": rounds,
+        "anomalies": anomalies,
+    }
+    _output(report, True)
 
 
 def cmd_archive(args):
@@ -958,6 +1477,7 @@ def main():
     run_p.add_argument("--change", type=str, default="")
     run_p.add_argument("--branch", type=str, default="mainline")
     run_p.add_argument("--inject", type=str, choices=["oom", "nan", "crash"])
+    run_p.add_argument("--strategy", type=str, default=None, help="JSON string of strategy overrides (see 'mlevo show-strategy')")
 
     # branch
     branch_p = subparsers.add_parser("branch", help="Create a branch")
@@ -992,6 +1512,14 @@ def main():
     # history
     history_p = subparsers.add_parser("history", help="Model ancestry")
     history_p.add_argument("--model", type=str, required=True)
+
+    # lr-history
+    lr_history_p = subparsers.add_parser("lr-history", help="Learning rate history for a branch")
+    lr_history_p.add_argument("--branch", type=str, default="mainline")
+    lr_history_p.add_argument("--last", type=int, default=10)
+
+    # show-strategy
+    subparsers.add_parser("show-strategy", help="Show default DecisionEngine strategy")
 
     # recover
     subparsers.add_parser("recover", help="Recover from crash")
@@ -1028,6 +1556,10 @@ def main():
     archive_p = subparsers.add_parser("archive", help="Archive plan")
     archive_p.add_argument("name", type=str)
 
+    # report
+    report_p = subparsers.add_parser("report", help="Generate structured fact report from logs")
+    report_p.add_argument("name", type=str, help="Plan name")
+
     sync_p = subparsers.add_parser("sync", help="Sync models to Google Drive")
     sync_p.add_argument("--dry-run", action="store_true", help="Preview without uploading")
 
@@ -1046,6 +1578,8 @@ def main():
         "models": cmd_models,
         "model": cmd_model,
         "history": cmd_history,
+        "lr-history": cmd_lr_history,
+        "show-strategy": cmd_show_strategy,
         "recover": cmd_recover,
         "migrate": cmd_migrate,
         "test": cmd_test,
@@ -1053,6 +1587,7 @@ def main():
         "new": cmd_new,
         "list": cmd_list,
         "archive": cmd_archive,
+        "report": cmd_report,
         "sync": cmd_sync,
         "plans": cmd_plans,
         "plan": cmd_plan_detail,

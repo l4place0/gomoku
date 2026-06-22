@@ -15,11 +15,28 @@ import shutil
 import gzip
 import platform
 import time
+import threading
+import random
 from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict
+
+try:
+    from ml.benchmark.metrics_collector import StageMetrics
+    _HAS_METRICS = True
+except ImportError:
+    _HAS_METRICS = False
+
+from ml.elo_tracker import EloTracker
+from ml.model_registry import compute_model_hash
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 KATA_ROOT = PROJECT_ROOT / "KataGomo"
+
+from ml.model_registry import ModelRegistry, DEFAULT_MODELS_DIR
 
 
 def _find_python():
@@ -55,6 +72,32 @@ def win_path(p):
         rest = s[6:].replace("/", "\\")
         return f"{drive}:{rest}"
     return s
+
+
+def get_vram_usage():
+    """Get current GPU VRAM usage in MiB. Returns (used, total) or (0, 0) on error."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(",")
+            used = int(parts[0].replace("MiB", "").strip())
+            total = int(parts[1].replace("MiB", "").strip())
+            return used, total
+    except Exception:
+        pass
+    return 0, 0
+
+
+def check_vram_safety(margin_mb=512):
+    """Check if VRAM has enough margin. Returns True if safe."""
+    used, total = get_vram_usage()
+    if total == 0:
+        return True  # Can't check, assume safe
+    remaining = total - used
+    return remaining >= margin_mb
 DEFAULT_DATA_DIR = BASE_DIR / "data" / "training_data"
 LOG_DIR = BASE_DIR / "data" / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,6 +121,7 @@ def create_parser():
     
     # Global Configs
     parser.add_argument("--round", type=int, default=1, help="Current generation round / iteration")
+    parser.add_argument("--serial", action="store_true", default=False, help="Run pipeline stages sequentially (default: parallel)")
     parser.add_argument("--model-name", type=str, default="b10c256nbt", help="Model name identifier")
     parser.add_argument("--gpu", type=int, default=0, help="CUDA GPU device index")
     parser.add_argument("--data-dir", type=str, default=str(DEFAULT_DATA_DIR), help="Directory to store training data")
@@ -105,12 +149,32 @@ def create_parser():
     parser.add_argument("--tr-lookahead-k", type=int, default=6, help="Lookahead optimizer k")
     parser.add_argument("--tr-swa-scale", type=float, default=1.0, help="SWA (Stochastic Weight Averaging) scale")
 
+    # Anti-overfitting / continual training parameters
+    parser.add_argument("--tr-max-bucket-per-data", type=int, default=8, help="Max training passes per new data row (KataGo recommends 8)")
+    parser.add_argument("--tr-max-bucket-size", type=int, default=500000, help="Max total training bucket size")
+    parser.add_argument("--tr-stop-when-limited", action="store_true", default=True, help="Stop training when bucket limit reached")
+    parser.add_argument("--tr-no-repeat-files", action="store_true", default=False, help="Do not re-use already trained files")
+
+    # Replay buffer parameters (anti-forgetting)
+    parser.add_argument("--replay-ratio", type=float, default=0.2, help="Fraction of selfplay data to keep in replay buffer")
+    parser.add_argument("--replay-max-rounds", type=int, default=5, help="Max number of rounds to keep in replay buffer")
+
+    # Golden data curriculum parameters (anti-forgetting)
+    parser.add_argument("--golden-min-visits", type=int, default=800, help="Min MCTS visits for golden position mining")
+    parser.add_argument("--golden-surprise-threshold", type=float, default=0.3, help="Policy surprise threshold for golden positions")
+    parser.add_argument("--golden-max-positions", type=int, default=5000, help="Max golden positions to retain")
+
+    # Fault tolerance parameters
+    parser.add_argument("--fault-tolerance", type=str, default="basic", choices=["off", "basic", "aggressive"],
+                        help="Fault tolerance level: off=no retry, basic=retry with backoff, aggressive=retry+validate+recover")
+
     # Shuffle parameters (extended)
     parser.add_argument("--sh-expand-window-per-row", type=float, default=0.3, help="Shuffle expand window per row")
     parser.add_argument("--sh-taper-window-exponent", type=float, default=0.8, help="Shuffle taper window exponent")
     parser.add_argument("--sh-approx-rows-per-file", type=int, default=50000, help="Approximate rows per shuffle output file")
 
     # Selfplay MCTS parameters
+    parser.add_argument("--sf-nn-max-batch-size", type=int, default=0, help="Max batch size for NN inference (0=use tr-batch)")
     parser.add_argument("--sf-max-moves", type=int, default=400, help="Max moves per selfplay game")
     parser.add_argument("--sf-rules", type=str, default="FREESTYLE", help="Game rules (FREESTYLE, STANDARD, RENJU, CARO)")
     parser.add_argument("--sf-temp-early", type=float, default=0.75, help="Chosen move temperature early")
@@ -131,9 +195,21 @@ def create_parser():
     # PK parameters
     parser.add_argument("--pk-games", type=int, default=20, help="Total number of PK games to evaluate")
     parser.add_argument("--pk-visits-b", type=int, default=128, help="MCTS visits for Black AI")
-    parser.add_argument("--pk-visits-w", type=int, default=64, help="MCTS visits for White AI")
+    parser.add_argument("--pk-visits-w", type=int, default=128, help="MCTS visits for White AI")
     parser.add_argument("--pk-threshold", type=float, default=0.55, help="Winrate threshold for model promotion")
-    
+    # SPRT parameters
+    parser.add_argument("--pk-sprt-h1", type=float, default=35.0, help="SPRT H1 hypothesis: Elo difference to detect")
+    parser.add_argument("--pk-sprt-alpha", type=float, default=0.05, help="SPRT Type I error rate")
+    parser.add_argument("--pk-sprt-beta", type=float, default=0.05, help="SPRT Type II error rate")
+    parser.add_argument("--pk-min-games", type=int, default=20, help="Minimum games before SPRT early stop")
+
+    # Regression PK parameters (anti-forgetting)
+    parser.add_argument("--pk-regression", action="store_true", default=True, help="Run regression PK against ancestor models after main PK passes")
+    parser.add_argument("--pk-no-regression", action="store_false", dest="pk_regression", help="Disable regression PK")
+    parser.add_argument("--pk-regression-games", type=int, default=10, help="Number of games per regression PK (fewer than main PK)")
+    parser.add_argument("--pk-regression-threshold", type=float, default=0.40, help="Winrate threshold to pass regression PK (looser than main)")
+    parser.add_argument("--pk-regression-depth", type=int, default=2, help="How many generations back to check (2=grandparent)")
+
     return parser
 
 def format_evidence_chain(args):
@@ -189,18 +265,93 @@ def format_evidence_chain(args):
         f"  --pk-visits-b        : {args.pk_visits_b}",
         f"  --pk-visits-w        : {args.pk_visits_w}",
         f"  --pk-threshold       : {args.pk_threshold}",
+        f"  --pk-sprt-h1         : {args.pk_sprt_h1}",
+        f"  --pk-sprt-alpha      : {args.pk_sprt_alpha}",
+        f"  --pk-sprt-beta       : {args.pk_sprt_beta}",
+        f"  --pk-min-games       : {args.pk_min_games}",
         "================================================================================"
     ]
     return "\n".join(lines)
 
-def evaluate_promotion(winrate, threshold):
-    return winrate >= threshold
+def evaluate_promotion(winrate, threshold, sprt_decision=None, elo_diff=None, elo_ci_lower=None, elo_ci_upper=None):
+    """Evaluate model promotion. Uses SPRT decision if available, falls back to threshold.
+
+    Args:
+        winrate: Candidate win rate.
+        threshold: Promotion threshold (used when no SPRT decision).
+        sprt_decision: SPRT decision string ("accept", "reject", or None).
+        elo_diff: Elo difference (candidate - baseline). Optional.
+        elo_ci_lower: Lower bound of 95% CI on Elo diff. Optional.
+        elo_ci_upper: Upper bound of 95% CI on Elo diff. Optional.
+
+    Returns:
+        True if model should be promoted.
+    """
+    if sprt_decision == "accept":
+        return True
+    if sprt_decision == "reject":
+        return False
+    promoted = winrate >= threshold
+    # Log warning when winrate passes but Elo CI includes 0 (uncertain)
+    if promoted and elo_diff is not None and elo_ci_lower is not None and elo_ci_upper is not None:
+        if elo_ci_lower <= 0 <= elo_ci_upper:
+            print(f"  [Elo] Warning: winrate {winrate:.2%} passes threshold but Elo CI includes 0 "
+                  f"(elo_diff={elo_diff:+.1f}, CI=[{elo_ci_lower:+.1f}, {elo_ci_upper:+.1f}]). "
+                  f"Promotion allowed but strength uncertain.", flush=True)
+    return promoted
+
+class BackgroundService:
+    """Runs a subprocess in a background thread with auto-restart."""
+
+    def __init__(self, name, cmd, log_file, interval=20, pre_run=None):
+        self.name = name
+        self.cmd = cmd
+        self.log_file = Path(log_file)
+        self.interval = interval
+        self._pre_run = pre_run  # Optional callback before each run
+        self._thread = None
+        self._stop = threading.Event()
+        self._proc = None
+
+    def start(self):
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True, name=f"bg-{self.name}")
+        self._thread.start()
+        print(f"  [BG] Started {self.name} service", flush=True)
+
+    def stop(self):
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+        if self._thread:
+            self._thread.join(timeout=10)
+        print(f"  [BG] Stopped {self.name} service", flush=True)
+
+    def _run_loop(self):
+        while not self._stop.is_set():
+            try:
+                if self._pre_run:
+                    self._pre_run()
+                self.log_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.log_file, "a", encoding="utf-8", errors="ignore") as f:
+                    self._proc = subprocess.Popen(
+                        self.cmd, stdout=f, stderr=subprocess.STDOUT, text=True
+                    )
+                    self._proc.wait()
+            except Exception as e:
+                print(f"  [BG] {self.name} error: {e}", file=sys.stderr, flush=True)
+            self._stop.wait(self.interval)
+
 
 def run_subprocess_redirected(cmd, log_file_path, env=None, mode="w"):
     try:
         log_file_path = Path(log_file_path)
         log_file_path.parent.mkdir(parents=True, exist_ok=True)
-        
+
         with open(log_file_path, mode, encoding="utf-8", errors="ignore") as f:
             proc = subprocess.Popen(
                 cmd,
@@ -214,6 +365,42 @@ def run_subprocess_redirected(cmd, log_file_path, env=None, mode="w"):
     except Exception as e:
         print(f"[Error] Subprocess launch failed: {e}", file=sys.stderr)
         return False
+
+
+def run_subprocess_with_retry(cmd, log_file_path, max_retries=3, backoff_factor=2, env=None):
+    """Run subprocess with exponential backoff retry on failure."""
+    for attempt in range(max_retries):
+        ok = run_subprocess_redirected(cmd, log_file_path, env=env, mode="w" if attempt == 0 else "a")
+        if ok:
+            return True
+        if attempt < max_retries - 1:
+            wait = backoff_factor ** attempt
+            print(f"  [Retry] Attempt {attempt+1}/{max_retries} failed, retrying in {wait}s...", flush=True)
+            time.sleep(wait)
+    return False
+
+
+def validate_selfplay_data(data_dir):
+    """Validate selfplay NPZ files. Returns list of valid files, prints warnings for corrupted."""
+    import numpy as np
+    selfplay_dir = data_dir / "selfplay"
+    if not selfplay_dir.exists():
+        return []
+    npz_files = sorted(selfplay_dir.rglob("*.npz"))
+    valid = []
+    for f in npz_files:
+        if f.stat().st_size == 0:
+            print(f"  [Validate] Skipping empty file: {f.name}", flush=True)
+            continue
+        try:
+            np.load(f, allow_pickle=False)
+            valid.append(f)
+        except Exception as e:
+            print(f"  [Validate] Corrupted file: {f.name} ({e})", flush=True)
+    if len(valid) < len(npz_files):
+        print(f"  [Validate] {len(npz_files) - len(valid)} corrupted/empty files skipped, {len(valid)} valid", flush=True)
+    return valid
+
 
 def sync_native_runtime_cfg(cfg_path, gpu, threads, visits, batch_size=128, *,
                             pos_len=15, max_moves=400, rules="FREESTYLE",
@@ -425,34 +612,167 @@ def mine_high_winrate_openings(data_dir):
             
     print(f"[Miner] Done. Appended/updated {count} high-winrate openings in {book_path}.")
 
-def main():
-    parser = create_parser()
-    args = parser.parse_args()
-    
-    # 1. Print param evidence chain
-    evidence_chain = format_evidence_chain(args)
-    print(evidence_chain, flush=True)
-    
-    data_dir = Path(args.data_dir)
-    logs_dir = LOG_DIR
-    
-    # Initialize necessary dirs
-    for d in [
-        data_dir,
-        data_dir / "selfplay",
-        data_dir / "models",
-        data_dir / "shuffleddata" / "current",
-        data_dir / "torchmodels_toexport",
-        data_dir / "models_exported",
-        data_dir / "shuffle_tmp",
-    ]:
-        d.mkdir(parents=True, exist_ok=True)
-        
-    round_no = args.round
-    
-    # ------------------ STAGE 1: SELFPLAY ------------------
+
+def mine_golden_positions(data_dir: Path, model_name: str, min_visits: int = 800,
+                          surprise_threshold: float = 0.3, max_positions: int = 5000):
+    """Mine high-value positions from search logs into curriculum directory for anti-forgetting training."""
+    search_log_path = KATA_ROOT / "logs" / "search_logs.jsonl"
+    if not search_log_path.exists():
+        search_log_path = Path("logs/search_logs.jsonl")
+    if not search_log_path.exists():
+        search_log_path = Path("search_logs.jsonl")
+    if not search_log_path.exists():
+        print("[Golden] search_logs.jsonl not found, skipping golden data mining.")
+        return
+
+    curriculum_dir = data_dir / "curriculum"
+    curriculum_dir.mkdir(parents=True, exist_ok=True)
+    output_path = curriculum_dir / "golden_positions.jsonl"
+
+    # Load existing golden positions to avoid duplicates
+    existing = set()
+    if output_path.exists():
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line.strip())
+                    existing.add(entry.get("key", ""))
+                except Exception:
+                    continue
+
+    count = 0
+    positions = []
+    with open(search_log_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            try:
+                entry = json.loads(line.strip())
+            except Exception:
+                continue
+
+            visits = entry.get("kataVisits", 0)
+            if visits < min_visits:
+                continue
+
+            # Calculate policy surprise: difference between top move prob and chosen move prob
+            moves = entry.get("moves", [])
+            chosen = entry.get("chosenMove")
+            if not moves or not chosen:
+                continue
+
+            chosen_x, chosen_y = chosen.get("x"), chosen.get("y")
+            if chosen_x is None or chosen_y is None:
+                continue
+
+            # Find policy of chosen move vs top policy
+            policies = [m.get("kataPolicy", 0.0) for m in moves]
+            chosen_policy = 0.0
+            for m in moves:
+                if m.get("x") == chosen_x and m.get("y") == chosen_y:
+                    chosen_policy = m.get("kataPolicy", 0.0)
+                    break
+
+            max_policy = max(policies) if policies else 1.0
+            surprise = max_policy - chosen_policy
+
+            if surprise < surprise_threshold:
+                continue
+
+            # Build a unique key from history + chosen move
+            hist_moves = entry.get("history", [])
+            key = f"{hist_moves}-{chosen_x},{chosen_y}"
+            if key in existing:
+                continue
+            existing.add(key)
+
+            positions.append({
+                "key": key,
+                "history": hist_moves,
+                "chosen": {"x": chosen_x, "y": chosen_y},
+                "surprise": round(surprise, 4),
+                "visits": visits,
+                "role": entry.get("role", ""),
+                "winrate": round((entry.get("chosenValue", 0) + 1.0) / 2.0, 4)
+                          if entry.get("chosenValue") is not None else None,
+            })
+            count += 1
+
+    # Trim to max_positions: keep highest surprise, merge with existing
+    all_positions = []
+    if output_path.exists():
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    all_positions.append(json.loads(line.strip()))
+                except Exception:
+                    continue
+    all_positions.extend(positions)
+    all_positions.sort(key=lambda p: p.get("surprise", 0), reverse=True)
+    all_positions = all_positions[:max_positions]
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        for p in all_positions:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+    print(f"[Golden] Mined {count} new positions, total {len(all_positions)} in {output_path}")
+
+
+@dataclass
+class StageResult:
+    """Result of a pipeline stage execution."""
+    success: bool
+    duration: float
+    log_file: Path
+    error: str = ""
+
+
+def _fill_replay_buffer(data_dir: Path, round_no: int, replay_ratio: float):
+    """Copy a random subset of current selfplay data to the replay buffer."""
+    selfplay_dir = data_dir / "selfplay"
+    replay_dir = data_dir / "replay_buffer" / f"round_{round_no:03d}"
+    if not selfplay_dir.exists():
+        return
+    # KataGo selfplay stores NPZ in models/tdata/ subdirectory
+    npz_files = sorted(selfplay_dir.rglob("*.npz"))
+    if not npz_files:
+        return
+    replay_dir.mkdir(parents=True, exist_ok=True)
+    k = max(1, int(len(npz_files) * replay_ratio))
+    selected = random.sample(npz_files, k)
+    for f in selected:
+        shutil.copy2(f, replay_dir / f.name)
+    print(f"  -> Replay buffer: copied {len(selected)}/{len(npz_files)} files to {replay_dir}", flush=True)
+
+
+def _cleanup_replay_buffer(data_dir: Path, max_rounds: int):
+    """Remove replay buffer rounds older than max_rounds (FIFO)."""
+    replay_root = data_dir / "replay_buffer"
+    if not replay_root.exists():
+        return
+    round_dirs = sorted(replay_root.glob("round_*"))
+    if len(round_dirs) <= max_rounds:
+        return
+    to_remove = round_dirs[: len(round_dirs) - max_rounds]
+    for d in to_remove:
+        shutil.rmtree(d)
+    print(f"  -> Replay buffer: cleaned {len(to_remove)} old rounds, keeping {max_rounds}", flush=True)
+
+
+def _get_replay_dirs(data_dir: Path) -> list:
+    """Return list of replay buffer round directories."""
+    replay_root = data_dir / "replay_buffer"
+    if not replay_root.exists():
+        return []
+    return sorted(replay_root.glob("round_*"))
+
+
+def run_selfplay(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute selfplay stage."""
+    start_time = time.time()
     save_progress("selfplay", 0)
     print(f"\n[Round {round_no}] [1/5] [Selfplay] Generating {args.sf_games} selfplay games...", flush=True)
+    sp_metrics = StageMetrics(round_no, "selfplay") if _HAS_METRICS else None
+    if sp_metrics:
+        sp_metrics.start()
     engine_name = "katago" if sys.platform != "win32" else "katago.exe"
     engine_path = KATA_ROOT / "scripts" / "engine" / engine_name
     cfg_path = data_dir / "native_selfplay_15.cfg"
@@ -470,7 +790,8 @@ def main():
             print(f"  -> [Warn] Opening selection failed: {opening_proc.stderr}", flush=True)
 
     # Synchronize config keys
-    sync_native_runtime_cfg(cfg_path, args.gpu, args.sf_threads, args.sf_visits, args.tr_batch,
+    nn_batch = args.sf_nn_max_batch_size if args.sf_nn_max_batch_size > 0 else args.tr_batch
+    sync_native_runtime_cfg(cfg_path, args.gpu, args.sf_threads, args.sf_visits, nn_batch,
                             pos_len=args.tr_pos_len, max_moves=args.sf_max_moves, rules=args.sf_rules,
                             temp_early=args.sf_temp_early, temp_halflife=args.sf_temp_halflife, temp_late=args.sf_temp_late,
                             policy_temp_early=args.sf_policy_temp_early, policy_temp=args.sf_policy_temp,
@@ -478,10 +799,10 @@ def main():
                             dirichlet_weight=args.sf_dirichlet_weight, dirichlet_concentration=args.sf_dirichlet_concentration,
                             policy_init_temp=args.sf_policy_init_temp, policy_init_avg_move=args.sf_policy_init_avg_move,
                             resign_threshold=args.sf_resign_threshold, resign_consec=args.sf_resign_consec)
-    
+
     selfplay_log = logs_dir / f"round_{round_no}_selfplay.log"
     print(f"  -> Verbose logs streaming to: {selfplay_log}", flush=True)
-    
+
     # If the engine actually exists, run it
     if engine_path.exists():
         cmd = [
@@ -492,27 +813,48 @@ def main():
             "-max-games-total", str(args.sf_games)
         ]
         env = gpu_env(args.gpu)
-        ok = run_subprocess_redirected(cmd, selfplay_log, env=env)
+        ft_level = getattr(args, 'fault_tolerance', 'basic')
+        if ft_level != 'off':
+            ok = run_subprocess_with_retry(cmd, selfplay_log, max_retries=3, env=env)
+        else:
+            ok = run_subprocess_redirected(cmd, selfplay_log, env=env)
         if not ok:
             print("[Error] Selfplay stage exited with errors! Please check selfplay log.", file=sys.stderr)
-            sys.exit(1)
+            return StageResult(False, time.time() - start_time, selfplay_log, "Selfplay failed")
     else:
         # Mock run if files do not exist (useful for test environments)
         print(f"  [Mock] {engine_name} engine not found. Simulating mock selfplay data generation...", flush=True)
         with open(selfplay_log, "w", encoding="utf-8") as f:
             f.write("Mock selfplay completed successfully\n")
-            
+
     save_progress("selfplay", 100)
+    if args.replay_ratio > 0:
+        _fill_replay_buffer(data_dir, round_no, args.replay_ratio)
+        _cleanup_replay_buffer(data_dir, args.replay_max_rounds)
+    if sp_metrics:
+        sp_metrics.finish(sf_games=args.sf_games, sf_visits=args.sf_visits, sf_threads=args.sf_threads)
+        sp_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [1/5] [Selfplay] Complete.", flush=True)
-    
-    # ------------------ STAGE 2: SHUFFLE ------------------
+    return StageResult(True, time.time() - start_time, selfplay_log)
+
+
+def run_shuffle(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute shuffle stage."""
+    start_time = time.time()
     save_progress("shuffle", 0)
     print(f"\n[Round {round_no}] [2/5] [Shuffle] Shuffling samples (min {args.sh_samples})...", flush=True)
     shuffle_log = logs_dir / f"round_{round_no}_shuffle.log"
     print(f"  -> Verbose logs streaming to: {shuffle_log}", flush=True)
-    
+
     shuffle_script = KATA_ROOT / "python" / "shuffle.py"
     if shuffle_script.exists():
+        # Validate selfplay data integrity before shuffling
+        ft_level = getattr(args, 'fault_tolerance', 'basic')
+        if ft_level != 'off':
+            valid_files = validate_selfplay_data(data_dir)
+            if not valid_files:
+                print("[Warning] No valid selfplay data found. Shuffle may produce empty output.", flush=True)
+
         # Clear old output and temp directories as shuffle.py expects them to not exist
         for old_dir in [
             data_dir / "shuffleddata" / "current" / "train",
@@ -522,14 +864,25 @@ def main():
         ]:
             if old_dir.exists():
                 shutil.rmtree(old_dir)
-                
+
         # Recreate the parent temporary directories because shuffle.py expects them to exist
         (data_dir / "shuffle_tmp" / "train").mkdir(parents=True, exist_ok=True)
         (data_dir / "shuffle_tmp" / "val").mkdir(parents=True, exist_ok=True)
-                
+
+        # Build input dirs: selfplay + replay buffer + curriculum
+        input_dirs = [str(data_dir / "selfplay")]
+        replay_dirs = _get_replay_dirs(data_dir)
+        if replay_dirs:
+            input_dirs.extend(str(d) for d in replay_dirs)
+            print(f"  -> Shuffle mixing {len(replay_dirs)} replay rounds + current selfplay", flush=True)
+        curriculum_dir = data_dir / "curriculum"
+        if curriculum_dir.exists() and list(curriculum_dir.glob("*.npz")):
+            input_dirs.append(str(curriculum_dir))
+            print(f"  -> Shuffle mixing golden curriculum data", flush=True)
+
         train_cmd = [
             _find_python(), str(shuffle_script),
-            str(data_dir / "selfplay"),
+            *input_dirs,
             "-expand-window-per-row", str(args.sh_expand_window_per_row),
             "-taper-window-exponent", str(args.sh_taper_window_exponent),
             "-out-dir", str(data_dir / "shuffleddata" / "current" / "train"),
@@ -543,7 +896,7 @@ def main():
         ]
         val_cmd = [
             _find_python(), str(shuffle_script),
-            str(data_dir / "selfplay"),
+            *input_dirs,
             "-expand-window-per-row", str(args.sh_expand_window_per_row),
             "-taper-window-exponent", str(args.sh_taper_window_exponent),
             "-out-dir", str(data_dir / "shuffleddata" / "current" / "val"),
@@ -559,19 +912,19 @@ def main():
         with open(shuffle_log, "a", encoding="utf-8") as f:
             f.write("\n--- Validation Shuffling ---\n")
         ok_val = run_subprocess_redirected(val_cmd, shuffle_log, mode="a")
-        
+
         if not ok_train or not ok_val:
             print("[Warning] Shuffling encountered errors (might be due to empty selfplay npz). Check logs.", file=sys.stderr)
-            
+
         # Self-healing: if val dataset is empty or val.json has no npz files, copy train to val
         train_npz = data_dir / "shuffleddata" / "current" / "train" / "data0.npz"
         val_npz = data_dir / "shuffleddata" / "current" / "val" / "data0.npz"
         val_json = data_dir / "shuffleddata" / "current" / "val.json"
-        
+
         val_npz_exists = False
         if val_npz.parent.exists():
             val_npz_exists = any(val_npz.parent.glob("*.npz"))
-            
+
         if train_npz.exists() and not val_npz_exists:
             val_npz.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(train_npz, val_npz)
@@ -582,16 +935,23 @@ def main():
         print("  [Mock] shuffle.py not found. Simulating data shuffling...", flush=True)
         with open(shuffle_log, "w") as f:
             f.write("Mock shuffling complete.\n")
-            
+
     save_progress("shuffle", 100)
     print(f"[Round {round_no}] [2/5] [Shuffle] Complete.", flush=True)
+    return StageResult(True, time.time() - start_time, shuffle_log)
 
-    # ------------------ STAGE 3: TRAIN ------------------
+
+def run_train(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute training stage."""
+    start_time = time.time()
     save_progress("train", 0)
     print(f"\n[Round {round_no}] [3/5] [Train] Initiating PyTorch training...", flush=True)
+    tr_metrics = StageMetrics(round_no, "train") if _HAS_METRICS else None
+    if tr_metrics:
+        tr_metrics.start()
     train_log = logs_dir / f"round_{round_no}_train.log"
     print(f"  -> Verbose logs streaming to: {train_log}", flush=True)
-    
+
     train_script = KATA_ROOT / "python" / "train.py"
     if train_script.exists():
         train_cmd = [
@@ -611,13 +971,29 @@ def main():
             "-lookahead-alpha", str(args.tr_lookahead_alpha),
             "-lookahead-k", str(args.tr_lookahead_k),
             "-swa-scale", str(args.tr_swa_scale),
+            "-max-train-bucket-per-new-data", str(args.tr_max_bucket_per_data),
+            "-max-train-bucket-size", str(args.tr_max_bucket_size),
         ]
+        if args.tr_stop_when_limited:
+            train_cmd.append("-stop-when-train-bucket-limited")
+        if args.tr_no_repeat_files:
+            train_cmd.append("-no-repeat-files")
         if args.tr_fp16:
             train_cmd.append("-use-fp16")
         env = gpu_env(args.gpu)
-        ok = run_subprocess_redirected(train_cmd, train_log, env=env)
+        ft_level = getattr(args, 'fault_tolerance', 'basic')
+        if ft_level != 'off':
+            ok = run_subprocess_with_retry(train_cmd, train_log, max_retries=3, env=env)
+        else:
+            ok = run_subprocess_redirected(train_cmd, train_log, env=env)
         if not ok:
-            print("[Warning] PyTorch trainer exited with warnings. Check logs.", file=sys.stderr)
+            # Checkpoint recovery: check if checkpoint exists for next attempt
+            train_dir = data_dir / "train" / args.model_name
+            checkpoints = list(train_dir.glob("checkpoint*.ckpt")) if train_dir.exists() else []
+            if checkpoints:
+                print(f"  [Recovery] {len(checkpoints)} checkpoint(s) found, will resume on next attempt", flush=True)
+            else:
+                print("[Warning] PyTorch trainer exited with warnings. Check logs.", file=sys.stderr)
     else:
         print("  [Mock] train.py not found. Simulating deep PyTorch training...", flush=True)
         # Create a mock checkpoint file to satisfy later steps
@@ -626,21 +1002,28 @@ def main():
         (chk_dir / "model.ckpt").write_text("mock weights checkpoint", encoding="utf-8")
         with open(train_log, "w") as f:
             f.write("Mock PyTorch training completed successfully. model.ckpt saved.\n")
-            
-    save_progress("train", 100)
-    print(f"[Round {round_no}] [3/5] [Train] Complete.", flush=True)
 
-    # ------------------ STAGE 4: EXPORT ------------------
+    save_progress("train", 100)
+    if tr_metrics:
+        tr_metrics.finish(tr_kind=args.tr_kind, tr_batch=args.tr_batch, tr_lr=args.tr_lr, tr_epochs=args.tr_epochs)
+        tr_metrics.append_to_log(logs_dir / "metrics.jsonl")
+    print(f"[Round {round_no}] [3/5] [Train] Complete.", flush=True)
+    return StageResult(True, time.time() - start_time, train_log)
+
+
+def run_export(args, data_dir: Path, logs_dir: Path, round_no: int) -> StageResult:
+    """Execute model export stage."""
+    start_time = time.time()
     save_progress("export", 0)
     print(f"\n[Round {round_no}] [4/5] [Export] Exporting candidate weights...", flush=True)
     export_log = logs_dir / f"round_{round_no}_export.log"
     print(f"  -> Verbose logs streaming to: {export_log}", flush=True)
-    
+
     export_script = KATA_ROOT / "python" / "export_model_pytorch.py"
     candidate_gz_dir = data_dir / "models_exported" / args.model_name
     candidate_gz_dir.mkdir(parents=True, exist_ok=True)
     candidate_gz_path = candidate_gz_dir / "model.bin.gz"
-    
+
     checkpoint = find_latest_checkpoint(data_dir)
     if export_script.exists() and checkpoint is not None:
         cmd = [
@@ -662,20 +1045,90 @@ def main():
         candidate_gz_path.write_text("mock binary weights gz", encoding="utf-8")
         with open(export_log, "w") as f:
             f.write("Mock export successful. gzipped weights ready.\n")
-            
+
     save_progress("export", 100)
     print(f"[Round {round_no}] [4/5] [Export] Complete.", flush=True)
+    return StageResult(True, time.time() - start_time, export_log)
 
-    # ------------------ STAGE 5: AUTOMATED PK ------------------
+
+def _run_regression_pks(args, data_dir: Path, logs_dir: Path, round_no: int,
+                        candidate_gz_path: Path, registry: ModelRegistry) -> list:
+    """Run regression PKs against ancestor models. Returns list of result dicts."""
+    runner_script = PROJECT_ROOT / "tools" / "headless_runner.py"
+    if not runner_script.exists():
+        return []
+
+    # Find current best model hash from registry
+    branch = "mainline"
+    best_record = registry.get_latest_promoted(branch)
+    if not best_record:
+        return []
+
+    results = []
+    for depth in range(2, args.pk_regression_depth + 1):
+        ancestor = registry.get_ancestor_at_depth(best_record.hash, depth)
+        if not ancestor:
+            break
+        ancestor_model = DEFAULT_MODELS_DIR / f"{ancestor.hash}.bin.gz"
+        if not ancestor_model.exists():
+            print(f"  [Regression] Ancestor model {ancestor.hash} not found at depth {depth}, skipping.", flush=True)
+            continue
+
+        pk_task_id = f"reg_r{round_no}_d{depth}_{int(time.time())}"
+        pk_out = data_dir / f"pk_regression_{pk_task_id}.json"
+        pk_log = logs_dir / f"round_{round_no}_regression_d{depth}.log"
+
+        cmd = [
+            _find_python(), str(runner_script),
+            "--black-model", str(candidate_gz_path),
+            "--white-model", str(ancestor_model),
+            "--games", str(args.pk_regression_games),
+            "--visits-black", str(args.pk_visits_b),
+            "--visits-white", str(args.pk_visits_w),
+            "--output", str(pk_out),
+            "--early-stop",
+            "--min-games", str(max(4, args.pk_regression_games // 3)),
+        ]
+        print(f"  [Regression] PK vs ancestor {ancestor.hash} (depth={depth}, round={ancestor.round})...", flush=True)
+        ok = run_subprocess_redirected(cmd, pk_log)
+
+        entry = {"ancestor": f"depth_{depth}", "hash": ancestor.hash, "round": ancestor.round}
+        if ok and pk_out.exists():
+            try:
+                r = json.loads(pk_out.read_text(encoding="utf-8"))
+                wins = r["summary"]["candidate_wins"]
+                losses = r["summary"]["baseline_wins"]
+                total = wins + losses
+                wr = wins / total if total > 0 else 0.0
+                entry.update({"wins": wins, "losses": losses, "winrate": round(wr, 4),
+                              "passed": wr >= args.pk_regression_threshold})
+                print(f"  [Regression] depth={depth}: {wins}/{total} ({wr:.2%}) {'PASS' if entry['passed'] else 'FAIL'}", flush=True)
+            except Exception as e:
+                entry.update({"wins": 0, "losses": 0, "winrate": 0.0, "passed": False, "error": str(e)})
+                print(f"  [Regression] depth={depth}: parse error: {e}", flush=True)
+        else:
+            entry.update({"wins": 0, "losses": 0, "winrate": 0.0, "passed": False, "error": "PK failed"})
+            print(f"  [Regression] depth={depth}: PK subprocess failed", flush=True)
+        results.append(entry)
+
+    return results
+
+
+def run_pk(args, data_dir: Path, logs_dir: Path, round_no: int, candidate_gz_path: Path) -> StageResult:
+    """Execute PK evaluation stage."""
+    start_time = time.time()
     save_progress("pk", 0)
+    sprt_result = None  # Will be set if SPRT data is available
     print(f"\n[Round {round_no}] [5/5] [PK] Initiating Headless Arena model evaluation...", flush=True)
+    pk_metrics = StageMetrics(round_no, "pk") if _HAS_METRICS else None
+    if pk_metrics:
+        pk_metrics.start()
     pk_log = logs_dir / f"round_{round_no}_pk.log"
     print(f"  -> Verbose logs streaming to: {pk_log}", flush=True)
-    
+
     runner_script = PROJECT_ROOT / "tools" / "headless_runner.py"
-    
     best_model_exists = GAME_MODEL_PATH.exists()
-    
+
     if not best_model_exists:
         print("  [PK] No current active best model found. Auto-promoting candidate immediately!", flush=True)
         winrate = 1.0
@@ -684,66 +1137,78 @@ def main():
     else:
         # Run PK Match
         if runner_script.exists():
-            # Run two rounds to ensure color balance
-            half_games = max(1, args.pk_games // 2)
-            
-            # Sub-round 1: Candidate is White, Best Model is Black
-            out1 = data_dir / "pk_sub1.json"
-            cmd1 = [
-                _find_python(), str(runner_script),
-                "--black-model", str(GAME_MODEL_PATH),
-                "--white-model", str(candidate_gz_path),
-                "--games", str(half_games),
-                "--visits-black", str(args.pk_visits_b),
-                "--visits-white", str(args.pk_visits_w),
-                "--output", str(out1)
-            ]
-            ok1 = run_subprocess_redirected(cmd1, pk_log)
-            
-            # Sub-round 2: Candidate is Black, Best Model is White
-            out2 = data_dir / "pk_sub2.json"
-            cmd2 = [
+            # Use task ID to avoid conflicts with orphan processes from killed runs
+            pk_task_id = f"r{round_no}_{int(time.time())}"
+            pk_out = data_dir / f"pk_result_{pk_task_id}.json"
+
+            # Clean stale PK results from prior rounds
+            for stale in data_dir.glob("pk_*.json"):
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+            print(f"  [PK] Task ID: {pk_task_id}", flush=True)
+
+            # Single process with alternating colors + early stop
+            cmd = [
                 _find_python(), str(runner_script),
                 "--black-model", str(candidate_gz_path),
                 "--white-model", str(GAME_MODEL_PATH),
-                "--games", str(half_games),
+                "--games", str(args.pk_games),
                 "--visits-black", str(args.pk_visits_b),
                 "--visits-white", str(args.pk_visits_w),
-                "--output", str(out2)
+                "--output", str(pk_out),
+                "--early-stop",
+                "--min-games", str(args.pk_min_games),
+                "--sprt-h1", str(args.pk_sprt_h1),
+                "--sprt-alpha", str(args.pk_sprt_alpha),
+                "--sprt-beta", str(args.pk_sprt_beta),
             ]
-            # Append log
-            with open(pk_log, "a", encoding="utf-8") as f:
-                f.write("\n--- Sub-Round 2 (Dynamic Color Swap) ---\n")
-            ok2 = run_subprocess_redirected(cmd2, pk_log, mode="a")
-            
-            # Calculate winrate from JSON outputs
+            ok = run_subprocess_redirected(cmd, pk_log)
+
+            # Calculate winrate from JSON output
             wins_new = 0
             losses_new = 0
-            
-            try:
-                _MAX_JSON_SIZE = 50 * 1024 * 1024  # 50MB
-                if out1.exists():
-                    if out1.stat().st_size > _MAX_JSON_SIZE:
-                        print(f"Warning: {out1} exceeds 50MB limit, skipping", file=sys.stderr)
+            cand_black_wins = 0
+            cand_white_wins = 0
+            base_black_wins = 0
+            base_white_wins = 0
+
+            if not ok:
+                print(f"[ERROR] PK subprocess failed (exit code non-zero). Check {pk_log}", file=sys.stderr)
+                winrate = 0.0
+            else:
+                try:
+                    _MAX_JSON_SIZE = 50 * 1024 * 1024  # 50MB
+                    if pk_out.exists():
+                        if pk_out.stat().st_size > _MAX_JSON_SIZE:
+                            print(f"Warning: {pk_out} exceeds 50MB limit, skipping", file=sys.stderr)
+                            winrate = 0.5
+                        else:
+                            r = json.loads(pk_out.read_text(encoding="utf-8"))
+                            wins_new = r["summary"]["candidate_wins"]
+                            losses_new = r["summary"]["baseline_wins"]
+                            cand_black_wins = r["summary"].get("candidate_black_wins", 0)
+                            cand_white_wins = r["summary"].get("candidate_white_wins", 0)
+                            base_black_wins = r["summary"].get("baseline_black_wins", 0)
+                            base_white_wins = r["summary"].get("baseline_white_wins", 0)
+                            total_pk = wins_new + losses_new
+                            winrate = wins_new / total_pk if total_pk > 0 else 0.0
+                            # Extract SPRT result if present
+                            sprt_result = r.get("sprt_result")
+                            if sprt_result:
+                                print(f"  [PK] SPRT: decision={sprt_result.get('decision')}, elo_diff={sprt_result.get('elo_diff', 'N/A')}, CI=[{sprt_result.get('ci_lower', 'N/A')}, {sprt_result.get('ci_upper', 'N/A')}]", flush=True)
+                            print(f"  [PK] Result: candidate={wins_new} baseline={losses_new} total={total_pk}", flush=True)
+                            print(f"  [PK] Color split: cand_black={r['summary'].get('candidate_black_wins',0)} cand_white={r['summary'].get('candidate_white_wins',0)}", flush=True)
                     else:
-                        r1 = json.loads(out1.read_text(encoding="utf-8"))
-                        wins_new += r1["summary"]["white_wins"]
-                        losses_new += r1["summary"]["black_wins"]
-                if out2.exists():
-                    if out2.stat().st_size > _MAX_JSON_SIZE:
-                        print(f"Warning: {out2} exceeds 50MB limit, skipping", file=sys.stderr)
-                    else:
-                        r2 = json.loads(out2.read_text(encoding="utf-8"))
-                        wins_new += r2["summary"]["black_wins"]
-                        losses_new += r2["summary"]["white_wins"]
-                
-                total_pk = wins_new + losses_new
-                winrate = wins_new / total_pk if total_pk > 0 else 0.0
-            except Exception as e:
-                print(f"[Warning] Failed to parse PK sub-reports ({e}). Defaulting to fallback evaluation.", file=sys.stderr)
-                winrate = 0.60
-                wins_new = 12
-                losses_new = 8
+                        print(f"[ERROR] PK output file not found: {pk_out}. PK evaluation failed.", file=sys.stderr)
+                        winrate = 0.0
+                except Exception as e:
+                    print(f"[ERROR] Failed to parse PK report ({e}). PK evaluation failed.", file=sys.stderr)
+                    winrate = 0.0
+                    wins_new = 0
+                    losses_new = 0
         else:
             print("  [Mock] headless_runner.py not found. Simulating deterministic PK winrate...", flush=True)
             winrate = 0.65
@@ -751,14 +1216,248 @@ def main():
             losses_new = args.pk_games - wins_new
             with open(pk_log, "w") as f:
                 f.write(f"Mock PK complete. Candidate winrate: {winrate:.2%}\n")
-                
+
+    # Run regression PKs against ancestor models if main PK passed
+    regression_results = []
+    if args.pk_regression and winrate >= args.pk_threshold:
+        try:
+            registry = ModelRegistry()
+            regression_results = _run_regression_pks(args, data_dir, logs_dir, round_no,
+                                                     candidate_gz_path, registry)
+            # Append regression results to PK output JSON
+            if regression_results and best_model_exists:
+                pk_out_file = data_dir / f"pk_result_r{round_no}_{int(time.time())}.json"
+                # Find the actual pk_out from the glob pattern
+                pk_outs = sorted(data_dir.glob(f"pk_result_r{round_no}_*.json"))
+                if pk_outs:
+                    pk_data = json.loads(pk_outs[-1].read_text(encoding="utf-8"))
+                    pk_data["regression_results"] = regression_results
+                    pk_outs[-1].write_text(json.dumps(pk_data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"  [Regression] Warning: regression PK skipped due to error: {e}", flush=True)
+
     save_progress("pk", 100)
+    if pk_metrics:
+        pk_metrics.finish(pk_games=args.pk_games, pk_visits_b=args.pk_visits_b, pk_visits_w=args.pk_visits_w, winrate=winrate)
+        pk_metrics.append_to_log(logs_dir / "metrics.jsonl")
     print(f"[Round {round_no}] [5/5] [PK] Result: Candidate Model wins {wins_new}/{args.pk_games} (Winrate: {winrate:.2%})", flush=True)
-    
+
+    # Store PK results in the result for later use
+    result = StageResult(True, time.time() - start_time, pk_log)
+    result._pk_winrate = winrate
+    result._pk_wins = wins_new
+    result._pk_losses = losses_new
+    result._sprt_result = sprt_result
+    result._regression_results = regression_results
+
+    # Record pairwise PK result for Elo tracking (skip auto-promote with no baseline)
+    elo_diff = None
+    elo_ci_lower = None
+    elo_ci_upper = None
+    if best_model_exists and (wins_new + losses_new) > 0:
+        try:
+            candidate_hash = compute_model_hash(candidate_gz_path)
+            baseline_hash = compute_model_hash(GAME_MODEL_PATH)
+            tracker = EloTracker()
+            tracker.record(
+                candidate_hash=candidate_hash,
+                baseline_hash=baseline_hash,
+                candidate_wins=wins_new,
+                baseline_wins=losses_new,
+                candidate_black_wins=cand_black_wins,
+                candidate_white_wins=cand_white_wins,
+                baseline_black_wins=base_black_wins,
+                baseline_white_wins=base_white_wins,
+                round_no=round_no,
+            )
+            # Compute Elo diff from accumulated history
+            try:
+                from ml.elo_rating import EloRatingEngine
+                engine = EloRatingEngine()
+                diff = engine.get_pairwise_diff(candidate_hash, baseline_hash)
+                if diff:
+                    elo_diff = float(diff.elo_diff)
+                    elo_ci_lower = float(diff.ci_lower)
+                    elo_ci_upper = float(diff.ci_upper)
+                    print(f"  [Elo] diff={elo_diff:+.1f}, CI=[{elo_ci_lower:+.1f}, {elo_ci_upper:+.1f}]", flush=True)
+            except Exception as e:
+                print(f"  [Elo] Warning: Elo computation failed: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"  [Elo] Warning: failed to record PK result: {e}", file=sys.stderr)
+
+    result._elo_diff = elo_diff
+    result._elo_ci_lower = elo_ci_lower
+    result._elo_ci_upper = elo_ci_upper
+    return result
+
+
+def run_pipeline(args, data_dir: Path, logs_dir: Path, round_no: int, serial: bool = True) -> Dict[str, StageResult]:
+    """Execute the full training pipeline.
+
+    Args:
+        args: Parsed CLI arguments
+        data_dir: Data directory path
+        logs_dir: Logs directory path
+        round_no: Current round number
+        serial: If True, run stages sequentially. If False, run selfplay+train in parallel.
+
+    Returns:
+        Dict mapping stage names to StageResult.
+    """
+    results = {}
+
+    if serial:
+        # Serial mode: run stages one by one
+        results["selfplay"] = run_selfplay(args, data_dir, logs_dir, round_no)
+        if not results["selfplay"].success:
+            return results
+
+        results["shuffle"] = run_shuffle(args, data_dir, logs_dir, round_no)
+        results["train"] = run_train(args, data_dir, logs_dir, round_no)
+        results["export"] = run_export(args, data_dir, logs_dir, round_no)
+        candidate_gz_path = data_dir / "models_exported" / args.model_name / "model.bin.gz"
+        results["pk"] = run_pk(args, data_dir, logs_dir, round_no, candidate_gz_path)
+    else:
+        # Parallel mode: start shuffle/export as background services
+        # Check VRAM safety before starting parallel execution
+        if not check_vram_safety(margin_mb=512):
+            used, total = get_vram_usage()
+            print(f"[Warning] VRAM low ({used}/{total} MiB). Falling back to serial mode.", flush=True)
+            return run_pipeline(args, data_dir, logs_dir, round_no, serial=True)
+
+        shuffle_script = KATA_ROOT / "python" / "shuffle.py"
+        export_script = KATA_ROOT / "python" / "export_model_pytorch.py"
+
+        bg_services = []
+
+        # Start shuffle background service
+        if shuffle_script.exists():
+            # Clear old shuffle output directories
+            for old_dir in [
+                data_dir / "shuffleddata" / "current" / "train",
+                data_dir / "shuffleddata" / "current" / "val",
+                data_dir / "shuffle_tmp" / "train",
+                data_dir / "shuffle_tmp" / "val",
+            ]:
+                if old_dir.exists():
+                    shutil.rmtree(old_dir)
+            (data_dir / "shuffle_tmp" / "train").mkdir(parents=True, exist_ok=True)
+            (data_dir / "shuffle_tmp" / "val").mkdir(parents=True, exist_ok=True)
+
+            shuffle_log = logs_dir / f"round_{round_no}_shuffle_bg.log"
+            # Build input dirs: selfplay + replay buffer + curriculum (previous rounds only in parallel mode)
+            bg_input_dirs = [str(data_dir / "selfplay")]
+            bg_replay_dirs = _get_replay_dirs(data_dir)
+            if bg_replay_dirs:
+                bg_input_dirs.extend(str(d) for d in bg_replay_dirs)
+            bg_curriculum = data_dir / "curriculum"
+            if bg_curriculum.exists() and list(bg_curriculum.glob("*.npz")):
+                bg_input_dirs.append(str(bg_curriculum))
+            shuffle_cmd = [
+                _find_python(), str(shuffle_script),
+                *bg_input_dirs,
+                "-expand-window-per-row", str(args.sh_expand_window_per_row),
+                "-taper-window-exponent", str(args.sh_taper_window_exponent),
+                "-out-dir", str(data_dir / "shuffleddata" / "current" / "train"),
+                "-out-tmp-dir", str(data_dir / "shuffle_tmp" / "train"),
+                "-approx-rows-per-out-file", str(args.sh_approx_rows_per_file),
+                "-num-processes", str(args.sh_threads),
+                "-batch-size", str(args.tr_batch),
+                "-min-rows", str(args.sh_samples),
+                "-keep-target-rows", str(args.sh_samples),
+                "-output-npz",
+            ]
+
+            def clear_shuffle_dirs():
+                for d in [data_dir / "shuffleddata" / "current" / "train",
+                          data_dir / "shuffle_tmp" / "train"]:
+                    if d.exists():
+                        shutil.rmtree(d)
+                (data_dir / "shuffle_tmp" / "train").mkdir(parents=True, exist_ok=True)
+
+            svc = BackgroundService("shuffle", shuffle_cmd, shuffle_log, interval=20, pre_run=clear_shuffle_dirs)
+            svc.start()
+            bg_services.append(svc)
+
+        # Run selfplay (blocking)
+        results["selfplay"] = run_selfplay(args, data_dir, logs_dir, round_no)
+        if not results["selfplay"].success:
+            for svc in bg_services:
+                svc.stop()
+            return results
+
+        # Run train (blocking, but shuffle runs in background)
+        results["train"] = run_train(args, data_dir, logs_dir, round_no)
+
+        # Stop background services
+        for svc in bg_services:
+            svc.stop()
+
+        # Run shuffle once more to ensure final data is ready
+        results["shuffle"] = run_shuffle(args, data_dir, logs_dir, round_no)
+
+        # Export
+        results["export"] = run_export(args, data_dir, logs_dir, round_no)
+        candidate_gz_path = data_dir / "models_exported" / args.model_name / "model.bin.gz"
+
+        # PK
+        results["pk"] = run_pk(args, data_dir, logs_dir, round_no, candidate_gz_path)
+
+    return results
+
+
+def main():
+    parser = create_parser()
+    args = parser.parse_args()
+
+    # 1. Print param evidence chain
+    evidence_chain = format_evidence_chain(args)
+    print(evidence_chain, flush=True)
+
+    data_dir = Path(args.data_dir)
+    logs_dir = LOG_DIR
+
+    # Initialize necessary dirs
+    for d in [
+        data_dir,
+        data_dir / "selfplay",
+        data_dir / "models",
+        data_dir / "shuffleddata" / "current",
+        data_dir / "torchmodels_toexport",
+        data_dir / "models_exported",
+        data_dir / "shuffle_tmp",
+    ]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    round_no = args.round
+
+    # ------------------ PIPELINE EXECUTION ------------------
+    results = run_pipeline(args, data_dir, logs_dir, round_no, serial=args.serial)
+
+    # Check for failures
+    if "selfplay" in results and not results["selfplay"].success:
+        print(f"[Error] Selfplay failed: {results['selfplay'].error}", file=sys.stderr)
+        sys.exit(1)
+
+    pk_result = results.get("pk")
+    candidate_gz_path = data_dir / "models_exported" / args.model_name / "model.bin.gz"
+    winrate = getattr(pk_result, '_pk_winrate', 0.5) if pk_result else 0.5
+    wins_new = getattr(pk_result, '_pk_wins', 0) if pk_result else 0
+    losses_new = getattr(pk_result, '_pk_losses', 0) if pk_result else 0
+    sprt_result = getattr(pk_result, '_sprt_result', None) if pk_result else None
+    sprt_decision = sprt_result.get('decision') if sprt_result else None
+    elo_diff = getattr(pk_result, '_elo_diff', None) if pk_result else None
+    elo_ci_lower = getattr(pk_result, '_elo_ci_lower', None) if pk_result else None
+    elo_ci_upper = getattr(pk_result, '_elo_ci_upper', None) if pk_result else None
+
     # ------------------ DECISION: PROMOTION ------------------
-    promoted = evaluate_promotion(winrate, args.pk_threshold)
+    promoted = evaluate_promotion(winrate, args.pk_threshold, sprt_decision,
+                                  elo_diff, elo_ci_lower, elo_ci_upper)
     if promoted:
-        print(f"\n[Round {round_no}] [RESULT] SUCCESS! Winrate {winrate:.2%} >= {args.pk_threshold:.2%}.", flush=True)
+        if sprt_decision == "accept":
+            print(f"\n[Round {round_no}] [RESULT] SUCCESS (SPRT)! Winrate {winrate:.2%}, Elo diff={sprt_result.get('elo_diff', 'N/A')}.", flush=True)
+        else:
+            print(f"\n[Round {round_no}] [RESULT] SUCCESS! Winrate {winrate:.2%} >= {args.pk_threshold:.2%}.", flush=True)
         print(f"[Round {round_no}] [RESULT] Promoting new model to best model...", flush=True)
         
         # Overwrite KataGomo active model
@@ -784,8 +1483,20 @@ def main():
             mine_high_winrate_openings(data_dir)
         except Exception as e:
             print(f"[Warning] Opening book mining failed: {e}", file=sys.stderr)
+
+        # Golden data curriculum mining
+        try:
+            mine_golden_positions(data_dir, args.model_name,
+                                  min_visits=args.golden_min_visits,
+                                  surprise_threshold=args.golden_surprise_threshold,
+                                  max_positions=args.golden_max_positions)
+        except Exception as e:
+            print(f"[Warning] Golden data mining failed: {e}", file=sys.stderr)
     else:
-        print(f"\n[Round {round_no}] [RESULT] DISCARDED. Winrate {winrate:.2%} < {args.pk_threshold:.2%}. Retaining old model.", flush=True)
+        if sprt_decision == "reject":
+            print(f"\n[Round {round_no}] [RESULT] DISCARDED (SPRT). Winrate {winrate:.2%}, Elo diff={sprt_result.get('elo_diff', 'N/A')}. Retaining old model.", flush=True)
+        else:
+            print(f"\n[Round {round_no}] [RESULT] DISCARDED. Winrate {winrate:.2%} < {args.pk_threshold:.2%}. Retaining old model.", flush=True)
         
     # ------------------ ARCHIVE EVIDENCE LEDGER ------------------
     ledger_path = logs_dir / "evolution_ledger.json"
@@ -800,18 +1511,26 @@ def main():
         except Exception:
             pass
             
+    pk_entry = {
+        "games": args.pk_games,
+        "wins_new": wins_new,
+        "losses_new": losses_new,
+        "winrate": winrate,
+        "threshold": args.pk_threshold,
+        "promoted": promoted
+    }
+    if sprt_result:
+        pk_entry["sprt"] = sprt_result
+    if elo_diff is not None:
+        pk_entry["elo_diff"] = round(elo_diff, 1)
+        pk_entry["elo_ci_lower"] = round(elo_ci_lower, 1)
+        pk_entry["elo_ci_upper"] = round(elo_ci_upper, 1)
+
     ledger.append({
         "round": round_no,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
         "params": vars(args),
-        "pk": {
-            "games": args.pk_games,
-            "wins_new": wins_new,
-            "losses_new": losses_new,
-            "winrate": winrate,
-            "threshold": args.pk_threshold,
-            "promoted": promoted
-        }
+        "pk": pk_entry
     })
     
     ledger_path.write_text(json.dumps(ledger, indent=2, ensure_ascii=False), encoding="utf-8")

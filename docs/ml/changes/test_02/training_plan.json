@@ -1,0 +1,38 @@
+{
+  "plan_name": "test_02",
+  "total_rounds": 5,
+  "model_kind": "b10c128",
+  "promotion_threshold": 0.55,
+  "stages": [
+    {
+      "start_round": 1,
+      "end_round": 5,
+      "config": {
+        "sf_games": 50,
+        "sf_visits": 64,
+        "sh_samples": 1000,
+        "tr_lr": 0.002,
+        "tr_batch": 16,
+        "tr_epochs": 1,
+        "pk_games": 20,
+        "pk_visits_b": 64,
+        "pk_visits_w": 64,
+        "pk_threshold": 0.55,
+        "pk_min_games": 20,
+        "sf_threads": 4,
+        "sh_threads": 2,
+        "tr_fp16": false,
+        "tr_pos_len": 15,
+        "tr_soft_policy_weight_scale": 8.0,
+        "tr_value_loss_scale": 0.6,
+        "tr_td_value_loss_scales": "0.6,0.6,0.6",
+        "tr_lookahead_alpha": 0.5,
+        "tr_lookahead_k": 6,
+        "tr_swa_scale": 1.0,
+        "tr_max_bucket_per_data": 8,
+        "tr_max_bucket_size": 500000,
+        "tr_stop_when_limited": true
+      }
+    }
+  ]
+}
